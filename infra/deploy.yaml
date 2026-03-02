@@ -1,0 +1,998 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Game Demo - Full AWS deployment stack.
+  Includes VPC, ECS Fargate, ALB, CloudFront + S3 frontend hosting,
+  DynamoDB tables, Kinesis, and IAM roles.
+
+# =============================================================================
+# Parameters
+# =============================================================================
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  GameServerImage:
+    Type: String
+    Default: ''
+    Description: >
+      Game server Docker image URI (e.g., 123456789.dkr.ecr.us-west-2.amazonaws.com/repo:latest).
+      Leave empty on first deploy; update after pushing images.
+
+  AgentCoreEndpointArn:
+    Type: String
+    Default: ''
+    Description: >
+      AgentCore Runtime endpoint ARN for NPC agent. Leave empty on first deploy;
+      set after creating the AgentCore runtime and endpoint via deploy.sh.
+
+  GameServerCpu:
+    Type: Number
+    Default: 256
+    Description: CPU units for game server task (256 = 0.25 vCPU)
+
+  GameServerMemory:
+    Type: Number
+    Default: 512
+    Description: Memory (MiB) for game server task
+
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-3-5-haiku-20241022-v1:0
+    Description: Bedrock model ID for the NPC agent
+
+  BedrockRegion:
+    Type: String
+    Default: us-west-2
+    Description: AWS region for Bedrock API calls
+
+Conditions:
+  HasGameServerImage: !Not [!Equals [!Ref GameServerImage, '']]
+  HasAgentCoreEndpoint: !Not [!Equals [!Ref AgentCoreEndpointArn, '']]
+
+# =============================================================================
+# Resources
+# =============================================================================
+
+Resources:
+
+  # ===========================================================================
+  # Networking — VPC, Subnets, IGW, NAT, Route Tables
+  # ===========================================================================
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'game-demo-vpc-${Environment}'
+        - Key: Project
+          Value: game-demo
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub 'game-demo-igw-${Environment}'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- Public Subnets ---
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'game-demo-public-1-${Environment}'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub 'game-demo-public-2-${Environment}'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub 'game-demo-public-rt-${Environment}'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # --- Private Subnets ---
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub 'game-demo-private-1-${Environment}'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub 'game-demo-private-2-${Environment}'
+
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub 'game-demo-nat-${Environment}'
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub 'game-demo-private-rt-${Environment}'
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ===========================================================================
+  # Security Groups
+  # ===========================================================================
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP/HTTPS inbound to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub 'game-demo-alb-sg-${Environment}'
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow traffic from ALB to ECS tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub 'game-demo-ecs-sg-${Environment}'
+
+  # ===========================================================================
+  # Application Load Balancer
+  # ===========================================================================
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub 'game-demo-alb-${Environment}'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Project
+          Value: game-demo
+
+  # --- Target Groups ---
+
+  GameServerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub 'game-server-tg-${Environment}'
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      # Enable stickiness for WebSocket connections
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400'
+
+  # --- Listener & Rules ---
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '404'
+            ContentType: text/plain
+            MessageBody: Not Found
+
+  # /api/* and /ws → game-server
+  GameServerAPIRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/api/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref GameServerTargetGroup
+
+  GameServerWSRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/ws'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref GameServerTargetGroup
+
+  # ===========================================================================
+  # ECR Repositories
+  # ===========================================================================
+
+  GameServerECR:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub 'game-demo-game-server-${Environment}'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # ===========================================================================
+  # ECS Cluster & Services
+  # ===========================================================================
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub 'game-demo-${Environment}'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # --- CloudWatch Log Groups ---
+
+  GameServerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/game-demo/game-server-${Environment}'
+      RetentionInDays: 30
+
+  # --- IAM Roles ---
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'game-demo-ecs-execution-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  GameServerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'game-demo-game-server-task-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt PlayersTable.Arn
+                  - !Sub '${PlayersTable.Arn}/index/*'
+                  - !GetAtt MonstersTable.Arn
+                  - !GetAtt NPCsTable.Arn
+                  - !GetAtt ItemsTable.Arn
+                  - !GetAtt TasksTable.Arn
+                  - !Sub '${TasksTable.Arn}/index/*'
+                  - !GetAtt PlayerEventSummaryTable.Arn
+                  - !Sub '${PlayerEventSummaryTable.Arn}/index/*'
+        - PolicyName: KinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: !GetAtt GameEventStream.Arn
+        - PolicyName: AgentCoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeAgent
+                  - bedrock:InvokeAgentRuntime
+                  - bedrock-agentcore:InvokeAgentRuntime
+                Resource: '*'
+
+  # --- AgentCore Runtime IAM Role (for NPC agent running on AgentCore) ---
+
+  AgentCoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'game-demo-agentcore-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                Resource:
+                  - !GetAtt PlayersTable.Arn
+                  - !Sub '${PlayersTable.Arn}/index/*'
+                  - !GetAtt MonstersTable.Arn
+                  - !GetAtt NPCsTable.Arn
+                  - !GetAtt ItemsTable.Arn
+                  - !GetAtt TasksTable.Arn
+                  - !Sub '${TasksTable.Arn}/index/*'
+                  - !GetAtt PlayerEventSummaryTable.Arn
+                  - !Sub '${PlayerEventSummaryTable.Arn}/index/*'
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+
+  # --- Task Definitions ---
+
+  GameServerTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasGameServerImage
+    Properties:
+      Family: !Sub 'game-demo-game-server-${Environment}'
+      Cpu: !Ref GameServerCpu
+      Memory: !Ref GameServerMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt GameServerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: game-server
+          Image: !Ref GameServerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: PORT
+              Value: '8080'
+            - Name: USE_DYNAMODB
+              Value: 'true'
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: AGENTCORE_ENDPOINT_ARN
+              Value: !Ref AgentCoreEndpointArn
+            - Name: ENV
+              Value: !Ref Environment
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref GameServerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: game-server
+
+  # --- ECS Services ---
+
+  GameServerService:
+    Type: AWS::ECS::Service
+    Condition: HasGameServerImage
+    DependsOn:
+      - GameServerAPIRule
+      - GameServerWSRule
+    Properties:
+      ServiceName: !Sub 'game-demo-game-server-${Environment}'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref GameServerTaskDef
+      LaunchType: FARGATE
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: game-server
+          ContainerPort: 8080
+          TargetGroupArn: !Ref GameServerTargetGroup
+
+  # ===========================================================================
+  # Frontend Hosting — S3 + CloudFront
+  # ===========================================================================
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'game-demo-frontend-${AWS::AccountId}-${Environment}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: game-demo
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'game-demo-oac-${Environment}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'Game Demo (${Environment})'
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+
+        Origins:
+          # S3 origin for static frontend files
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+
+          # ALB origin for API and WebSocket
+          - Id: ALBOrigin
+            DomainName: !GetAtt ALB.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+          Compress: true
+
+        CacheBehaviors:
+          # /api/* → ALB (no caching)
+          - PathPattern: /api/*
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
+            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # AllViewer
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - PATCH
+              - POST
+              - DELETE
+
+          # /ws → ALB (WebSocket upgrade)
+          - PathPattern: /ws
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
+            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # AllViewer
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - PATCH
+              - POST
+              - DELETE
+
+        # SPA fallback: return index.html for missing paths
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+      Tags:
+        - Key: Project
+          Value: game-demo
+
+  # ===========================================================================
+  # S3 Bucket for AgentCore code artifacts
+  # ===========================================================================
+
+  AgentCoreArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'game-demo-agentcore-${AWS::AccountId}-${Environment}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===========================================================================
+  # DynamoDB Tables
+  # ===========================================================================
+
+  PlayersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'Players-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: player_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: player_id
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+  MonstersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'Monsters-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: monster_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: monster_id
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+  NPCsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'NPCs-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: npc_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: npc_id
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'Items-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: item_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: item_id
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'Tasks-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: task_id
+          AttributeType: S
+        - AttributeName: player_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: task_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: player_id-index
+          KeySchema:
+            - AttributeName: player_id
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+  PlayerEventSummaryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'PlayerEventSummary-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: player_id
+          AttributeType: S
+        - AttributeName: event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: player_id
+          KeyType: HASH
+        - AttributeName: event_id
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===========================================================================
+  # Kinesis Data Stream
+  # ===========================================================================
+
+  GameEventStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub 'GameEventStream-${Environment}'
+      ShardCount: 1
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===========================================================================
+  # S3 Bucket for behavior log storage (Kinesis Firehose destination)
+  # ===========================================================================
+
+  GameDemoLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'game-demo-logs-${AWS::AccountId}-${Environment}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 365
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ===========================================================================
+  # Kinesis Firehose → S3
+  # ===========================================================================
+
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'game-demo-firehose-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt GameDemoLogsBucket.Arn
+                  - !Sub '${GameDemoLogsBucket.Arn}/*'
+        - PolicyName: FirehoseKinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                  - kinesis:ListShards
+                Resource: !GetAtt GameEventStream.Arn
+
+  GameEventFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub 'game-demo-firehose-${Environment}'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt GameEventStream.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt GameDemoLogsBucket.Arn
+        Prefix: !Sub 'game-events/${Environment}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        ErrorOutputPrefix: !Sub 'game-events-errors/${Environment}/'
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 5
+        CompressionFormat: GZIP
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+
+# =============================================================================
+# Outputs
+# =============================================================================
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  ALBDNSName:
+    Description: ALB DNS name for API/WebSocket access
+    Value: !GetAtt ALB.DNSName
+
+  CloudFrontURL:
+    Description: CloudFront distribution URL (game entry point)
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (for cache invalidation)
+    Value: !Ref CloudFrontDistribution
+
+  FrontendBucketName:
+    Description: S3 bucket for frontend static files
+    Value: !Ref FrontendBucket
+
+  ECSClusterName:
+    Description: ECS cluster name
+    Value: !Ref ECSCluster
+
+  GameServerECRUri:
+    Description: ECR repository URI for game server
+    Value: !GetAtt GameServerECR.RepositoryUri
+
+  AgentCoreRoleArn:
+    Description: IAM role ARN for AgentCore Runtime (NPC agent)
+    Value: !GetAtt AgentCoreRole.Arn
+
+  PlayersTableName:
+    Description: Name of the Players DynamoDB table
+    Value: !Ref PlayersTable
+
+  PlayersTableArn:
+    Description: ARN of the Players DynamoDB table
+    Value: !GetAtt PlayersTable.Arn
+
+  MonstersTableName:
+    Description: Name of the Monsters DynamoDB table
+    Value: !Ref MonstersTable
+
+  NPCsTableName:
+    Description: Name of the NPCs DynamoDB table
+    Value: !Ref NPCsTable
+
+  ItemsTableName:
+    Description: Name of the Items DynamoDB table
+    Value: !Ref ItemsTable
+
+  TasksTableName:
+    Description: Name of the Tasks DynamoDB table
+    Value: !Ref TasksTable
+
+  PlayerEventSummaryTableName:
+    Description: Name of the PlayerEventSummary DynamoDB table
+    Value: !Ref PlayerEventSummaryTable
+
+  GameEventStreamName:
+    Description: Kinesis stream name
+    Value: !Ref GameEventStream
+
+  GameDemoLogsBucketName:
+    Description: S3 bucket for game event logs
+    Value: !Ref GameDemoLogsBucket
+
+  AgentCoreArtifactBucketName:
+    Description: S3 bucket for AgentCore NPC agent code artifacts
+    Value: !Ref AgentCoreArtifactBucket
