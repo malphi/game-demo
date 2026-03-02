@@ -146,7 +146,7 @@ get_agentcore_endpoint_arn() {
   # Try to get existing endpoint ARN from an AgentCore runtime endpoint
   local runtime_id
   runtime_id=$(aws bedrock-agentcore-control list-agent-runtimes \
-    --query "agentRuntimeSummaries[?agentRuntimeName=='game-demo-npc-agent-${ENV}'].agentRuntimeId | [0]" \
+    --query "agentRuntimeSummaries[?agentRuntimeName=='game_demo_npc_agent_${ENV}'].agentRuntimeId | [0]" \
     --output text --region "${REGION}" 2>/dev/null || echo "None")
 
   if [[ "${runtime_id}" == "None" || -z "${runtime_id}" ]]; then
@@ -199,7 +199,7 @@ deploy_agentcore() {
   rm -f "${zip_file}"
 
   # 3. Create or update AgentCore runtime
-  local runtime_name="game-demo-npc-agent-${ENV}"
+  local runtime_name="game_demo_npc_agent_${ENV}"
   local runtime_id
 
   # Check if runtime already exists
@@ -259,7 +259,7 @@ deploy_agentcore() {
     echo "    Creating AgentCore runtime endpoint..."
     endpoint_arn=$(aws bedrock-agentcore-control create-agent-runtime-endpoint \
       --agent-runtime-id "${runtime_id}" \
-      --name "game-demo-npc-agent-ep-${ENV}" \
+      --name "game_demo_npc_agent_ep_${ENV}" \
       --query 'agentRuntimeEndpointArn' \
       --output text --region "${REGION}")
     echo "    Endpoint created: ${endpoint_arn}"

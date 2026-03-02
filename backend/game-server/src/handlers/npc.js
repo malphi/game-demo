@@ -428,23 +428,28 @@ function hasConsumableInInventory(player, itemId) {
  * Call the NPC Agent via AgentCore Runtime (production mode).
  */
 async function callNPCAgentAgentCore(playerId, npcId) {
-  const { BedrockAgentCoreRuntimeClient, InvokeAgentRuntimeCommand } = require('@aws-sdk/client-bedrock-agentcore-runtime');
-  const client = new BedrockAgentCoreRuntimeClient({
+  const { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } = require('@aws-sdk/client-bedrock-agentcore');
+  const client = new BedrockAgentCoreClient({
     region: process.env.AWS_REGION || 'us-west-2',
   });
 
+  const payload = JSON.stringify({ player_id: playerId, npc_id: npcId });
   const command = new InvokeAgentRuntimeCommand({
-    agentRuntimeEndpointArn: process.env.AGENTCORE_ENDPOINT_ARN,
-    payload: JSON.stringify({ player_id: playerId, npc_id: npcId }),
+    agentRuntimeArn: process.env.AGENTCORE_ENDPOINT_ARN,
+    contentType: 'application/json',
+    accept: 'application/json',
+    payload: Buffer.from(payload),
   });
 
   const response = await client.send(command);
 
-  // Parse the response payload
-  const payloadStr = typeof response.payload === 'string'
-    ? response.payload
-    : new TextDecoder().decode(response.payload);
-  return JSON.parse(payloadStr);
+  // Read the streaming response body
+  const chunks = [];
+  for await (const chunk of response.response) {
+    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+  }
+  const body = Buffer.concat(chunks).toString('utf-8');
+  return JSON.parse(body);
 }
 
 /**
