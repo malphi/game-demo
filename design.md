@@ -1205,6 +1205,30 @@ flowchart LR
 | Amazon VPC | 网络隔离（公有子网: IGW，私有子网: EC2/AgentCore，VPC Endpoints 替代 NAT Gateway） |
 | AWS Systems Manager | Session Manager 端口转发（开发阶段远程访问） |
 
+### 9.1 AWS 服务成本估算（基于 100 万次/月调用）
+
+以下基于 **月调用量 1M 次 NPC 对话**、使用 **Prompt Caching + 精简 Prompt** 方案估算。
+
+#### Token 估算依据
+
+Token 数基于 `agent.py` 实际发送给 LLM 的内容测算（详见 `npc_system_prompt.txt` 和 `agent.py:347-355`）：
+
+- **System Prompt**（可缓存）：48 行中文模板 + JSON 格式 + 任务规则 + NPC 人设，约 **800 tokens**
+- **User Message**（不可缓存）：玩家状态、背包、事件、任务 + 精简字典子集，约 **550 tokens**
+- **Output**：NPC 对话 + 任务 JSON，约 **200 tokens**
+
+> 代码中已对字典数据做了裁剪（`monsters_slim` 只保留 `id/name/lv`，`items_slim` 只保留 `id/name/type`）。精简 Prompt 进一步只发送与玩家等级相关的字典子集。
+
+#### 月成本明细
+
+| 服务 | 月成本计算公式 | 总成本 |
+|------|--------------|--------|
+| Bedrock Claude Haiku 4.5 | Cache Read: 1M × 800 tok × $0.10/MTok = $80 + Non-cached Input: 1M × 550 tok × $1.00/MTok = $550 + Output: 1M × 200 tok × $5.00/MTok = $1,000 | **$1,630** |
+| AgentCore 运行时 | 1M 调用 × ~5s/调用 ≈ 1,389 compute-hours（按 Fargate 类似定价估算） | **~$50–150** |
+| **合计** | | **~$1,700–1,800** |
+
+> **说明**：Bedrock 单价为 Input $1.00/MTok、Output $5.00/MTok、Cache Read $0.10/MTok（90% 折扣）。Output 占 Bedrock 成本的 61%（$1,000/$1,630），因输出单价是输入的 5 倍。
+
 ---
 
 ## 10. 项目目录结构（建议）
