@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Game Demo - Full AWS deployment stack.
-  Includes VPC, ECS Fargate, ALB, CloudFront + S3 frontend hosting,
+  Includes VPC (with VPC Endpoints), EC2, CloudFront + S3 frontend hosting,
   DynamoDB tables, Kinesis, and IAM roles.
 
 # =============================================================================
@@ -18,29 +18,24 @@ Parameters:
       - prod
     Description: Deployment environment
 
-  GameServerImage:
+  GameServerInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type for the game server
+
+  AgentCoreRuntimeArn:
     Type: String
     Default: ''
     Description: >
-      Game server Docker image URI (e.g., 123456789.dkr.ecr.us-west-2.amazonaws.com/repo:latest).
-      Leave empty on first deploy; update after pushing images.
+      AgentCore Runtime ARN for NPC agent (e.g., arn:aws:bedrock-agentcore:...:runtime/xxx).
+      Leave empty on first deploy; set after creating the AgentCore runtime via deploy.sh.
 
-  AgentCoreEndpointArn:
+  AgentCoreEndpointName:
     Type: String
     Default: ''
     Description: >
-      AgentCore Runtime endpoint ARN for NPC agent. Leave empty on first deploy;
-      set after creating the AgentCore runtime and endpoint via deploy.sh.
-
-  GameServerCpu:
-    Type: Number
-    Default: 256
-    Description: CPU units for game server task (256 = 0.25 vCPU)
-
-  GameServerMemory:
-    Type: Number
-    Default: 512
-    Description: Memory (MiB) for game server task
+      AgentCore Runtime endpoint name for NPC agent (used as qualifier).
+      Leave empty on first deploy; set after creating the endpoint via deploy.sh.
 
   BedrockModelId:
     Type: String
@@ -53,8 +48,7 @@ Parameters:
     Description: AWS region for Bedrock API calls
 
 Conditions:
-  HasGameServerImage: !Not [!Equals [!Ref GameServerImage, '']]
-  HasAgentCoreEndpoint: !Not [!Equals [!Ref AgentCoreEndpointArn, '']]
+  HasAgentCoreRuntime: !Not [!Equals [!Ref AgentCoreRuntimeArn, '']]
 
 # =============================================================================
 # Resources
@@ -63,7 +57,7 @@ Conditions:
 Resources:
 
   # ===========================================================================
-  # Networking — VPC, Subnets, IGW, NAT, Route Tables
+  # Networking — VPC, Subnets, IGW, Route Tables, VPC Endpoints
   # ===========================================================================
 
   VPC:
@@ -165,21 +159,6 @@ Resources:
         - Key: Name
           Value: !Sub 'game-demo-private-2-${Environment}'
 
-  NATGatewayEIP:
-    Type: AWS::EC2::EIP
-    DependsOn: VPCGatewayAttachment
-    Properties:
-      Domain: vpc
-
-  NATGateway:
-    Type: AWS::EC2::NatGateway
-    Properties:
-      AllocationId: !GetAtt NATGatewayEIP.AllocationId
-      SubnetId: !Ref PublicSubnet1
-      Tags:
-        - Key: Name
-          Value: !Sub 'game-demo-nat-${Environment}'
-
   PrivateRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -188,12 +167,7 @@ Resources:
         - Key: Name
           Value: !Sub 'game-demo-private-rt-${Environment}'
 
-  PrivateRoute:
-    Type: AWS::EC2::Route
-    Properties:
-      RouteTableId: !Ref PrivateRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref NATGateway
+  # No default route (no NAT Gateway) — all AWS service access via VPC Endpoints
 
   PrivateSubnet1RouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -208,199 +182,141 @@ Resources:
       RouteTableId: !Ref PrivateRouteTable
 
   # ===========================================================================
-  # Security Groups
+  # VPC Endpoints — AWS service access without NAT Gateway
   # ===========================================================================
 
-  ALBSecurityGroup:
+  # --- Gateway Endpoints (free, route-table based) ---
+
+  DynamoDBEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  # --- Interface Endpoints (ENI-based, for Bedrock / SSM / ECR) ---
+
+  VPCEndpointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow HTTP/HTTPS inbound to ALB
+      GroupDescription: Security group for VPC Interface Endpoints (allow HTTPS from VPC)
       VpcId: !Ref VPC
       SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          CidrIp: 0.0.0.0/0
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: 0.0.0.0/0
+          CidrIp: 10.0.0.0/16
       Tags:
         - Key: Name
-          Value: !Sub 'game-demo-alb-sg-${Environment}'
+          Value: !Sub 'game-demo-vpce-sg-${Environment}'
 
-  ECSSecurityGroup:
+  BedrockRuntimeEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.bedrock-runtime'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # ===========================================================================
+  # Security Groups
+  # ===========================================================================
+
+  AgentCoreSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow traffic from ALB to ECS tasks
+      GroupDescription: Security group for AgentCore Runtime (VPC mode)
       VpcId: !Ref VPC
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 8080
-          ToPort: 8080
-          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      # No inbound rules — AgentCore is invoked via AWS SDK, not direct network
+      # Default outbound allows all (DynamoDB via Gateway Endpoint, Bedrock via Interface Endpoint)
       Tags:
         - Key: Name
-          Value: !Sub 'game-demo-ecs-sg-${Environment}'
+          Value: !Sub 'game-demo-agentcore-sg-${Environment}'
 
-  # ===========================================================================
-  # Application Load Balancer
-  # ===========================================================================
-
-  ALB:
-    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+  GameServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
     Properties:
-      Name: !Sub 'game-demo-alb-${Environment}'
-      Scheme: internet-facing
-      Type: application
-      Subnets:
-        - !Ref PublicSubnet1
-        - !Ref PublicSubnet2
-      SecurityGroups:
-        - !Ref ALBSecurityGroup
-      Tags:
-        - Key: Project
-          Value: game-demo
-
-  # --- Target Groups ---
-
-  GameServerTargetGroup:
-    Type: AWS::ElasticLoadBalancingV2::TargetGroup
-    Properties:
-      Name: !Sub 'game-server-tg-${Environment}'
-      Protocol: HTTP
-      Port: 8080
+      GroupDescription: Security group for game server EC2 (SSM access only, no inbound needed)
       VpcId: !Ref VPC
-      TargetType: ip
-      HealthCheckPath: /api/health
-      HealthCheckIntervalSeconds: 30
-      HealthyThresholdCount: 2
-      UnhealthyThresholdCount: 3
-      # Enable stickiness for WebSocket connections
-      TargetGroupAttributes:
-        - Key: stickiness.enabled
-          Value: 'true'
-        - Key: stickiness.type
-          Value: lb_cookie
-        - Key: stickiness.lb_cookie.duration_seconds
-          Value: '86400'
-
-  # --- Listener & Rules ---
-
-  ALBListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      LoadBalancerArn: !Ref ALB
-      Port: 80
-      Protocol: HTTP
-      DefaultActions:
-        - Type: fixed-response
-          FixedResponseConfig:
-            StatusCode: '404'
-            ContentType: text/plain
-            MessageBody: Not Found
-
-  # /api/* and /ws → game-server
-  GameServerAPIRule:
-    Type: AWS::ElasticLoadBalancingV2::ListenerRule
-    Properties:
-      ListenerArn: !Ref ALBListener
-      Priority: 10
-      Conditions:
-        - Field: path-pattern
-          Values:
-            - '/api/*'
-      Actions:
-        - Type: forward
-          TargetGroupArn: !Ref GameServerTargetGroup
-
-  GameServerWSRule:
-    Type: AWS::ElasticLoadBalancingV2::ListenerRule
-    Properties:
-      ListenerArn: !Ref ALBListener
-      Priority: 20
-      Conditions:
-        - Field: path-pattern
-          Values:
-            - '/ws'
-      Actions:
-        - Type: forward
-          TargetGroupArn: !Ref GameServerTargetGroup
+      # No inbound rules — access via SSM Session Manager port forwarding only
+      Tags:
+        - Key: Name
+          Value: !Sub 'game-demo-gs-sg-${Environment}'
 
   # ===========================================================================
-  # ECR Repositories
+  # Game Server — EC2 + Auto Scaling Group
   # ===========================================================================
-
-  GameServerECR:
-    Type: AWS::ECR::Repository
-    Properties:
-      RepositoryName: !Sub 'game-demo-game-server-${Environment}'
-      ImageScanningConfiguration:
-        ScanOnPush: true
-      LifecyclePolicy:
-        LifecyclePolicyText: |
-          {
-            "rules": [
-              {
-                "rulePriority": 1,
-                "description": "Keep last 10 images",
-                "selection": {
-                  "tagStatus": "any",
-                  "countType": "imageCountMoreThan",
-                  "countNumber": 10
-                },
-                "action": { "type": "expire" }
-              }
-            ]
-          }
-
-  # ===========================================================================
-  # ECS Cluster & Services
-  # ===========================================================================
-
-  ECSCluster:
-    Type: AWS::ECS::Cluster
-    Properties:
-      ClusterName: !Sub 'game-demo-${Environment}'
-      ClusterSettings:
-        - Name: containerInsights
-          Value: enabled
-
-  # --- CloudWatch Log Groups ---
-
-  GameServerLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub '/ecs/game-demo/game-server-${Environment}'
-      RetentionInDays: 30
 
   # --- IAM Roles ---
 
-  ECSTaskExecutionRole:
+  GameServerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub 'game-demo-ecs-execution-${Environment}'
+      RoleName: !Sub 'game-demo-game-server-${Environment}'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
-              Service: ecs-tasks.amazonaws.com
+              Service: ec2.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-
-  GameServerTaskRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub 'game-demo-game-server-task-${Environment}'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ecs-tasks.amazonaws.com
-            Action: sts:AssumeRole
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
       Policies:
         - PolicyName: DynamoDBAccess
           PolicyDocument:
@@ -445,6 +361,118 @@ Resources:
                   - bedrock:InvokeAgentRuntime
                   - bedrock-agentcore:InvokeAgentRuntime
                 Resource: '*'
+        - PolicyName: S3ArtifactAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt AgentCoreArtifactBucket.Arn
+                  - !Sub '${AgentCoreArtifactBucket.Arn}/*'
+
+  GameServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub 'game-demo-game-server-${Environment}'
+      Roles:
+        - !Ref GameServerRole
+
+  # --- Launch Template ---
+
+  GameServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub 'game-demo-gs-${Environment}'
+      LaunchTemplateData:
+        ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        InstanceType: !Ref GameServerInstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt GameServerInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref GameServerSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub 'game-demo-gs-${Environment}'
+              - Key: Project
+                Value: game-demo
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -ex
+
+            # Install Node.js 20 from AL2023 built-in repos (served via S3, no internet needed)
+            dnf install -y nodejs20 unzip
+
+            # Download game server code from S3 (via S3 Gateway Endpoint)
+            mkdir -p /opt/game-server
+            aws s3 cp s3://${AgentCoreArtifactBucket}/game-server/latest.zip /opt/game-server/code.zip --region ${AWS::Region} || true
+            if [ -f /opt/game-server/code.zip ]; then
+              cd /opt/game-server
+              unzip -o code.zip
+              # node_modules is pre-packaged in the zip, no npm ci needed
+            fi
+
+            # Create systemd service
+            cat > /etc/systemd/system/game-server.service << 'EOF'
+            [Unit]
+            Description=Game Demo Server
+            After=network.target
+
+            [Service]
+            Type=simple
+            WorkingDirectory=/opt/game-server
+            EnvironmentFile=/opt/game-server/.env
+            ExecStart=/usr/bin/node src/index.js
+            Restart=always
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            # Create environment file
+            cat > /opt/game-server/.env << ENVEOF
+            PORT=8080
+            USE_DYNAMODB=true
+            AWS_REGION=${AWS::Region}
+            ENV=${Environment}
+            AGENTCORE_RUNTIME_ARN=${AgentCoreRuntimeArn}
+            AGENTCORE_ENDPOINT_NAME=${AgentCoreEndpointName}
+            ENVEOF
+
+            # Start service if code was downloaded
+            if [ -f /opt/game-server/src/index.js ]; then
+              systemctl daemon-reload
+              systemctl enable game-server
+              systemctl start game-server
+            fi
+
+  # --- Auto Scaling Group (single instance, handles target group registration) ---
+
+  GameServerASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub 'game-demo-gs-${Environment}'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref GameServerLaunchTemplate
+        Version: !GetAtt GameServerLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Project
+          Value: game-demo
+          PropagateAtLaunch: false
 
   # --- AgentCore Runtime IAM Role (for NPC agent running on AgentCore) ---
 
@@ -494,74 +522,17 @@ Resources:
                   - bedrock:InvokeModel
                   - bedrock:InvokeModelWithResponseStream
                 Resource: '*'
-
-  # --- Task Definitions ---
-
-  GameServerTaskDef:
-    Type: AWS::ECS::TaskDefinition
-    Condition: HasGameServerImage
-    Properties:
-      Family: !Sub 'game-demo-game-server-${Environment}'
-      Cpu: !Ref GameServerCpu
-      Memory: !Ref GameServerMemory
-      NetworkMode: awsvpc
-      RequiresCompatibilities:
-        - FARGATE
-      RuntimePlatform:
-        CpuArchitecture: ARM64
-        OperatingSystemFamily: LINUX
-      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
-      TaskRoleArn: !GetAtt GameServerTaskRole.Arn
-      ContainerDefinitions:
-        - Name: game-server
-          Image: !Ref GameServerImage
-          Essential: true
-          PortMappings:
-            - ContainerPort: 8080
-              Protocol: tcp
-          Environment:
-            - Name: PORT
-              Value: '8080'
-            - Name: USE_DYNAMODB
-              Value: 'true'
-            - Name: AWS_REGION
-              Value: !Ref AWS::Region
-            - Name: AGENTCORE_ENDPOINT_ARN
-              Value: !Ref AgentCoreEndpointArn
-            - Name: ENV
-              Value: !Ref Environment
-          LogConfiguration:
-            LogDriver: awslogs
-            Options:
-              awslogs-group: !Ref GameServerLogGroup
-              awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: game-server
-
-  # --- ECS Services ---
-
-  GameServerService:
-    Type: AWS::ECS::Service
-    Condition: HasGameServerImage
-    DependsOn:
-      - GameServerAPIRule
-      - GameServerWSRule
-    Properties:
-      ServiceName: !Sub 'game-demo-game-server-${Environment}'
-      Cluster: !Ref ECSCluster
-      TaskDefinition: !Ref GameServerTaskDef
-      LaunchType: FARGATE
-      DesiredCount: 1
-      NetworkConfiguration:
-        AwsvpcConfiguration:
-          Subnets:
-            - !Ref PrivateSubnet1
-            - !Ref PrivateSubnet2
-          SecurityGroups:
-            - !Ref ECSSecurityGroup
-      LoadBalancers:
-        - ContainerName: game-server
-          ContainerPort: 8080
-          TargetGroupArn: !Ref GameServerTargetGroup
+        - PolicyName: ECRPullAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: '*'
 
   # ===========================================================================
   # Frontend Hosting — S3 + CloudFront
@@ -623,49 +594,11 @@ Resources:
             S3OriginConfig:
               OriginAccessIdentity: ''
 
-          # ALB origin for API and WebSocket
-          - Id: ALBOrigin
-            DomainName: !GetAtt ALB.DNSName
-            CustomOriginConfig:
-              HTTPPort: 80
-              OriginProtocolPolicy: http-only
-
         DefaultCacheBehavior:
           TargetOriginId: S3Origin
           ViewerProtocolPolicy: redirect-to-https
           CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
           Compress: true
-
-        CacheBehaviors:
-          # /api/* → ALB (no caching)
-          - PathPattern: /api/*
-            TargetOriginId: ALBOrigin
-            ViewerProtocolPolicy: redirect-to-https
-            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
-            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # AllViewer
-            AllowedMethods:
-              - GET
-              - HEAD
-              - OPTIONS
-              - PUT
-              - PATCH
-              - POST
-              - DELETE
-
-          # /ws → ALB (WebSocket upgrade)
-          - PathPattern: /ws
-            TargetOriginId: ALBOrigin
-            ViewerProtocolPolicy: redirect-to-https
-            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
-            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # AllViewer
-            AllowedMethods:
-              - GET
-              - HEAD
-              - OPTIONS
-              - PUT
-              - PATCH
-              - POST
-              - DELETE
 
         # SPA fallback: return index.html for missing paths
         CustomErrorResponses:
@@ -931,10 +864,6 @@ Outputs:
     Description: VPC ID
     Value: !Ref VPC
 
-  ALBDNSName:
-    Description: ALB DNS name for API/WebSocket access
-    Value: !GetAtt ALB.DNSName
-
   CloudFrontURL:
     Description: CloudFront distribution URL (game entry point)
     Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
@@ -947,13 +876,9 @@ Outputs:
     Description: S3 bucket for frontend static files
     Value: !Ref FrontendBucket
 
-  ECSClusterName:
-    Description: ECS cluster name
-    Value: !Ref ECSCluster
-
-  GameServerECRUri:
-    Description: ECR repository URI for game server
-    Value: !GetAtt GameServerECR.RepositoryUri
+  GameServerASGName:
+    Description: Auto Scaling Group name for game server EC2
+    Value: !Ref GameServerASG
 
   AgentCoreRoleArn:
     Description: IAM role ARN for AgentCore Runtime (NPC agent)
@@ -998,3 +923,15 @@ Outputs:
   AgentCoreArtifactBucketName:
     Description: S3 bucket for AgentCore NPC agent code artifacts
     Value: !Ref AgentCoreArtifactBucket
+
+  PrivateSubnet1Id:
+    Description: Private subnet 1 ID (for AgentCore VPC mode)
+    Value: !Ref PrivateSubnet1
+
+  PrivateSubnet2Id:
+    Description: Private subnet 2 ID (for AgentCore VPC mode)
+    Value: !Ref PrivateSubnet2
+
+  AgentCoreSecurityGroupId:
+    Description: Security group ID for AgentCore Runtime (VPC mode)
+    Value: !Ref AgentCoreSecurityGroup
