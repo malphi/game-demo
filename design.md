@@ -428,7 +428,12 @@ Demo 架构中，EC2 和 AgentCore 均运行在 VPC 私有子网，**不使用 N
 │  │                         │     │                    │  │
 │  │                         │     │  Interface (ENI):  │  │
 │  │                         ├────→│   · bedrock-runtime│  │
-│  │                         ├────→│   · ssm           │  │
+│  │                         ├────→│   · bedrock-agentcore│ │
+│  │                         ├────→│   · bedrock-agentcore│ │
+│  │                         │     │     .gateway       │  │
+│  │                         ├────→│   · sts            │  │
+│  │                         ├────→│   · ecr.api/dkr    │  │
+│  │                         ├────→│   · ssm            │  │
 │  │                         ├────→│   · ssmmessages   │  │
 │  │                         ├────→│   · ec2messages   │  │
 │  └─────────────────────────┘     └────────────────────┘  │
@@ -442,6 +447,11 @@ Demo 架构中，EC2 和 AgentCore 均运行在 VPC 私有子网，**不使用 N
 | `com.amazonaws.{region}.dynamodb` | Gateway | EC2/AgentCore 读写 DynamoDB | 免费 |
 | `com.amazonaws.{region}.s3` | Gateway | EC2 从 S3 下载代码包、AL2023 dnf 包管理 | 免费 |
 | `com.amazonaws.{region}.bedrock-runtime` | Interface | AgentCore 调用 Bedrock Converse API | ~$7.2/月 (ENI) |
+| `com.amazonaws.{region}.bedrock-agentcore` | Interface | EC2 调用 AgentCore InvokeAgentRuntime | ~$7.2/月 (ENI) |
+| `com.amazonaws.{region}.bedrock-agentcore.gateway` | Interface | AgentCore 容器运行时通信通道 | ~$7.2/月 (ENI) |
+| `com.amazonaws.{region}.sts` | Interface | AgentCore 容器获取 IAM 凭证 | ~$7.2/月 (ENI) |
+| `com.amazonaws.{region}.ecr.api` | Interface | AgentCore 容器镜像拉取（API） | ~$7.2/月 (ENI) |
+| `com.amazonaws.{region}.ecr.dkr` | Interface | AgentCore 容器镜像拉取（Docker） | ~$7.2/月 (ENI) |
 | `com.amazonaws.{region}.ssm` | Interface | SSM Session Manager 端口转发 | ~$7.2/月 (ENI) |
 | `com.amazonaws.{region}.ssmmessages` | Interface | SSM Session Manager 消息通道 | ~$7.2/月 (ENI) |
 | `com.amazonaws.{region}.ec2messages` | Interface | SSM Agent 通信 | ~$7.2/月 (ENI) |
