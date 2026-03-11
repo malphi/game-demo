@@ -6,16 +6,9 @@ export default class WebSocketClient {
     this.ws = null;
     this.connected = false;
     this.messageHandlers = {};
-    // In production (CloudFront/ALB), use same host with appropriate protocol.
-    // In local dev (port 3000/3001 via Vite), connect directly to game-server on port 8080.
-    const isDev = ['localhost', '127.0.0.1'].includes(window.location.hostname)
-      && ['3000', '3001'].includes(window.location.port);
-    if (isDev) {
-      this.url = `ws://${window.location.hostname}:8080/ws`;
-    } else {
-      const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      this.url = `${wsProto}//${window.location.host}/ws`;
-    }
+    // Frontend and backend are served from the same EC2 instance (same host:port).
+    const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    this.url = `${wsProto}//${window.location.host}/ws`;
   }
 
   connect() {

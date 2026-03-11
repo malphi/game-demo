@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Game Demo - Full AWS deployment stack.
-  Includes VPC (with VPC Endpoints), EC2, CloudFront + S3 frontend hosting,
+  Includes VPC (with VPC Endpoints), EC2 (frontend + backend),
   DynamoDB tables, Kinesis, and IAM roles.
 
 # =============================================================================
@@ -600,85 +600,6 @@ Resources:
                 Resource: '*'
 
   # ===========================================================================
-  # Frontend Hosting — S3 + CloudFront
-  # ===========================================================================
-
-  FrontendBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub 'game-demo-frontend-${AWS::AccountId}-${Environment}'
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      Tags:
-        - Key: Project
-          Value: game-demo
-
-  FrontendBucketPolicy:
-    Type: AWS::S3::BucketPolicy
-    Properties:
-      Bucket: !Ref FrontendBucket
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Sid: AllowCloudFrontOAC
-            Effect: Allow
-            Principal:
-              Service: cloudfront.amazonaws.com
-            Action: s3:GetObject
-            Resource: !Sub '${FrontendBucket.Arn}/*'
-            Condition:
-              StringEquals:
-                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
-
-  CloudFrontOAC:
-    Type: AWS::CloudFront::OriginAccessControl
-    Properties:
-      OriginAccessControlConfig:
-        Name: !Sub 'game-demo-oac-${Environment}'
-        OriginAccessControlOriginType: s3
-        SigningBehavior: always
-        SigningProtocol: sigv4
-
-  CloudFrontDistribution:
-    Type: AWS::CloudFront::Distribution
-    Properties:
-      DistributionConfig:
-        Enabled: true
-        Comment: !Sub 'Game Demo (${Environment})'
-        DefaultRootObject: index.html
-        PriceClass: PriceClass_100
-
-        Origins:
-          # S3 origin for static frontend files
-          - Id: S3Origin
-            DomainName: !GetAtt FrontendBucket.RegionalDomainName
-            OriginAccessControlId: !Ref CloudFrontOAC
-            S3OriginConfig:
-              OriginAccessIdentity: ''
-
-        DefaultCacheBehavior:
-          TargetOriginId: S3Origin
-          ViewerProtocolPolicy: redirect-to-https
-          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
-          Compress: true
-
-        # SPA fallback: return index.html for missing paths
-        CustomErrorResponses:
-          - ErrorCode: 403
-            ResponseCode: 200
-            ResponsePagePath: /index.html
-          - ErrorCode: 404
-            ResponseCode: 200
-            ResponsePagePath: /index.html
-
-      Tags:
-        - Key: Project
-          Value: game-demo
-
-  # ===========================================================================
   # S3 Bucket for AgentCore code artifacts
   # ===========================================================================
 
@@ -928,18 +849,6 @@ Outputs:
   VPCId:
     Description: VPC ID
     Value: !Ref VPC
-
-  CloudFrontURL:
-    Description: CloudFront distribution URL (game entry point)
-    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
-
-  CloudFrontDistributionId:
-    Description: CloudFront distribution ID (for cache invalidation)
-    Value: !Ref CloudFrontDistribution
-
-  FrontendBucketName:
-    Description: S3 bucket for frontend static files
-    Value: !Ref FrontendBucket
 
   GameServerASGName:
     Description: Auto Scaling Group name for game server EC2

@@ -8,7 +8,6 @@ set -euo pipefail
 #   ./infra/deploy.sh --env dev --region us-west-2          # Full deployment
 #   ./infra/deploy.sh --env dev --region us-west-2 --stack-only
 #   ./infra/deploy.sh --env dev --region us-west-2 --gameserver-only
-#   ./infra/deploy.sh --env dev --region us-west-2 --frontend-only
 #   ./infra/deploy.sh --env dev --region us-west-2 --seed-only
 #   ./infra/deploy.sh --env dev --region us-west-2 --agentcore-only
 # =============================================================================
@@ -22,7 +21,6 @@ REGION="us-west-2"
 STACK_NAME=""
 STACK_ONLY=false
 GAMESERVER_ONLY=false
-FRONTEND_ONLY=false
 SEED_ONLY=false
 AGENTCORE_ONLY=false
 
@@ -35,8 +33,7 @@ Options:
   --region REGION     AWS region. Default: us-west-2
   --stack-name NAME   CloudFormation stack name. Default: game-demo-{env}
   --stack-only        Deploy only the CloudFormation stack
-  --gameserver-only   Upload game server code and refresh EC2 instance
-  --frontend-only     Build and upload frontend only
+  --gameserver-only   Build frontend + game server, deploy to EC2
   --seed-only         Seed DynamoDB tables only
   --agentcore-only    Deploy NPC agent to AgentCore Runtime only
   -h, --help          Show this help message
@@ -52,7 +49,6 @@ while [[ $# -gt 0 ]]; do
     --stack-name) STACK_NAME="$2"; shift 2 ;;
     --stack-only) STACK_ONLY=true; shift ;;
     --gameserver-only) GAMESERVER_ONLY=true; shift ;;
-    --frontend-only) FRONTEND_ONLY=true; shift ;;
     --seed-only)  SEED_ONLY=true; shift ;;
     --agentcore-only) AGENTCORE_ONLY=true; shift ;;
     -h|--help)    usage ;;
@@ -381,45 +377,6 @@ deploy_agentcore() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 4: Build and upload frontend
-# ---------------------------------------------------------------------------
-deploy_frontend() {
-  echo ">>> Building frontend"
-  cd "${PROJECT_ROOT}/frontend"
-  npm install
-  npm run build
-  cd "${PROJECT_ROOT}"
-  echo ""
-
-  # Get S3 bucket name from stack outputs
-  local bucket_name
-  bucket_name=$(aws cloudformation describe-stacks \
-    --stack-name "${STACK_NAME}" \
-    --query "Stacks[0].Outputs[?OutputKey=='FrontendBucketName'].OutputValue" \
-    --output text --region "${REGION}")
-
-  echo ">>> Uploading frontend to s3://${bucket_name}/"
-  aws s3 sync "${PROJECT_ROOT}/frontend/dist/" "s3://${bucket_name}/" \
-    --delete --region "${REGION}"
-  echo "    Frontend uploaded."
-  echo ""
-
-  # Invalidate CloudFront cache
-  local distribution_id
-  distribution_id=$(aws cloudformation describe-stacks \
-    --stack-name "${STACK_NAME}" \
-    --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDistributionId'].OutputValue" \
-    --output text --region "${REGION}")
-
-  echo ">>> Invalidating CloudFront cache (distribution: ${distribution_id})"
-  aws cloudfront create-invalidation \
-    --distribution-id "${distribution_id}" \
-    --paths "/*" --region "${REGION}" > /dev/null
-  echo "    Cache invalidation submitted."
-  echo ""
-}
-
-# ---------------------------------------------------------------------------
 # Step 5: Seed DynamoDB tables
 # ---------------------------------------------------------------------------
 seed_tables() {
@@ -438,8 +395,6 @@ if $STACK_ONLY; then
   deploy_stack
 elif $GAMESERVER_ONLY; then
   deploy_game_server_code
-elif $FRONTEND_ONLY; then
-  deploy_frontend
 elif $SEED_ONLY; then
   seed_tables
 elif $AGENTCORE_ONLY; then
@@ -451,7 +406,6 @@ else
   deploy_agentcore
   # Re-deploy stack with AgentCore endpoint now available
   deploy_stack
-  deploy_frontend
   seed_tables
 fi
 
@@ -460,10 +414,23 @@ echo "=============================================="
 echo "  Deployment Complete!"
 echo "=============================================="
 
-CLOUDFRONT_URL=$(aws cloudformation describe-stacks \
-  --stack-name "${STACK_NAME}" \
-  --query "Stacks[0].Outputs[?OutputKey=='CloudFrontURL'].OutputValue" \
+# Get EC2 instance ID for SSM access
+INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names "$(aws cloudformation describe-stacks \
+    --stack-name "${STACK_NAME}" \
+    --query "Stacks[0].Outputs[?OutputKey=='GameServerASGName'].OutputValue" \
+    --output text --region "${REGION}")" \
+  --query "AutoScalingGroups[0].Instances[0].InstanceId" \
   --output text --region "${REGION}" 2>/dev/null || echo "N/A")
 
-echo "  CloudFront URL: ${CLOUDFRONT_URL}"
+echo "  EC2 Instance: ${INSTANCE_ID}"
+echo ""
+echo "  Access via SSM port forwarding:"
+echo "    aws ssm start-session \\"
+echo "      --target ${INSTANCE_ID} \\"
+echo "      --document-name AWS-StartPortForwardingSession \\"
+echo "      --parameters '{\"portNumber\":[\"8080\"],\"localPortNumber\":[\"8080\"]}' \\"
+echo "      --region ${REGION}"
+echo ""
+echo "  Then open: http://localhost:8080"
 echo "=============================================="

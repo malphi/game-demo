@@ -161,7 +161,7 @@ export default class GameScene extends Phaser.Scene {
             name: this.player.playerName,
           };
           console.log('[API:REQ] POST /api/game/start', reqBody);
-          const resp = await fetch(`http://${window.location.hostname}:8080/api/game/start`, {
+          const resp = await fetch(`${window.location.origin}/api/game/start`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(reqBody),
