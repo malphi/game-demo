@@ -1,0 +1,291 @@
+// Game dictionaries
+
+export const MONSTER_DICT = {
+  slime_01: {
+    monster_id: 'slime_01',
+    name: '史莱姆',
+    level: 1,
+    hp: 40,
+    attack: 15,
+    defense: 3,
+    exp_reward: 10,
+    gold_reward: 5,
+    drop_items: [{ item_id: 'leather_armor', probability: 1.0 }],
+    size: 32,
+    color: 0xff4444,
+  },
+  goblin_01: {
+    monster_id: 'goblin_01',
+    name: '哥布林',
+    level: 2,
+    hp: 70,
+    attack: 22,
+    defense: 8,
+    exp_reward: 25,
+    gold_reward: 15,
+    drop_items: [
+      { item_id: 'iron_ore', probability: 0.4 },
+      { item_id: 'hp_potion_s', probability: 0.3 },
+    ],
+    size: 40,
+    color: 0xdd2222,
+  },
+  wolf_01: {
+    monster_id: 'wolf_01',
+    name: '灰狼',
+    level: 3,
+    hp: 100,
+    attack: 28,
+    defense: 12,
+    exp_reward: 45,
+    gold_reward: 25,
+    drop_items: [
+      { item_id: 'wolf_fang', probability: 0.5 },
+      { item_id: 'leather_scrap', probability: 0.6 },
+    ],
+    size: 44,
+    color: 0xcc3333,
+  },
+  orc_01: {
+    monster_id: 'orc_01',
+    name: '兽人战士',
+    level: 4,
+    hp: 120,
+    attack: 32,
+    defense: 15,
+    exp_reward: 80,
+    gold_reward: 50,
+    drop_items: [
+      { item_id: 'iron_ore', probability: 0.6 },
+      { item_id: 'orc_shield_fragment', probability: 0.3 },
+    ],
+    size: 52,
+    color: 0xbb1111,
+  },
+  dragon_01: {
+    monster_id: 'dragon_01',
+    name: '幼龙',
+    level: 5,
+    hp: 140,
+    attack: 36,
+    defense: 17,
+    exp_reward: 150,
+    gold_reward: 100,
+    drop_items: [
+      { item_id: 'dragon_scale', probability: 0.4 },
+      { item_id: 'flame_gem', probability: 0.2 },
+    ],
+    size: 60,
+    color: 0x990000,
+  },
+};
+
+export const NPC_DICT = {
+  npc_elder: {
+    npc_id: 'npc_elder',
+    name: '村长老莫',
+    role: '村庄长老',
+    personality: '慈祥稳重',
+    position_x: 500,
+    position_y: 300,
+    color: 0x4488ff,
+  },
+  npc_blacksmith: {
+    npc_id: 'npc_blacksmith',
+    name: '铁匠格雷',
+    role: '武器店铁匠',
+    personality: '粗犷豪爽',
+    position_x: 350,
+    position_y: 450,
+    color: 0x2266dd,
+  },
+  npc_merchant: {
+    npc_id: 'npc_merchant',
+    name: '商人莉娜',
+    role: '流浪商人',
+    personality: '精明狡黠',
+    position_x: 650,
+    position_y: 400,
+    color: 0x5599ff,
+  },
+  npc_healer: {
+    npc_id: 'npc_healer',
+    name: '药师艾琳',
+    role: '教堂药师',
+    personality: '温柔细心',
+    position_x: 380,
+    position_y: 170,
+    color: 0x77bbff,
+  },
+};
+
+export const ITEM_DICT = {
+  hp_potion_s: {
+    item_id: 'hp_potion_s',
+    name: '小生命药水',
+    type: 'consumable',
+    effect: { hp_restore: 30 },
+  },
+  hp_potion_m: {
+    item_id: 'hp_potion_m',
+    name: '中生命药水',
+    type: 'consumable',
+    effect: { hp_restore: 80 },
+  },
+  hp_potion_l: {
+    item_id: 'hp_potion_l',
+    name: '大生命药水',
+    type: 'consumable',
+    effect: { hp_restore: 200 },
+  },
+  atk_potion: {
+    item_id: 'atk_potion',
+    name: '力量药剂',
+    type: 'consumable',
+    effect: { attack_boost: 10, duration_battles: 3 },
+  },
+  def_potion: {
+    item_id: 'def_potion',
+    name: '铁壁药剂',
+    type: 'consumable',
+    effect: { defense_boost: 10, duration_battles: 3 },
+  },
+  wooden_sword: {
+    item_id: 'wooden_sword',
+    name: '木剑',
+    type: 'equipment',
+    sub_type: 'weapon',
+    effect: { attack: 3 },
+  },
+  iron_sword: {
+    item_id: 'iron_sword',
+    name: '铁剑',
+    type: 'equipment',
+    sub_type: 'weapon',
+    effect: { attack: 8 },
+  },
+  steel_sword: {
+    item_id: 'steel_sword',
+    name: '钢剑',
+    type: 'equipment',
+    sub_type: 'weapon',
+    effect: { attack: 15 },
+  },
+  flame_blade: {
+    item_id: 'flame_blade',
+    name: '烈焰之刃',
+    type: 'equipment',
+    sub_type: 'weapon',
+    effect: { attack: 25, fire_damage: 5 },
+  },
+  cloth_armor: {
+    item_id: 'cloth_armor',
+    name: '布甲',
+    type: 'equipment',
+    sub_type: 'armor',
+    effect: { defense: 2 },
+  },
+  leather_armor: {
+    item_id: 'leather_armor',
+    name: '皮甲',
+    type: 'equipment',
+    sub_type: 'armor',
+    effect: { defense: 5 },
+  },
+  iron_armor: {
+    item_id: 'iron_armor',
+    name: '铁甲',
+    type: 'equipment',
+    sub_type: 'armor',
+    effect: { defense: 12 },
+  },
+  dragon_armor: {
+    item_id: 'dragon_armor',
+    name: '龙鳞甲',
+    type: 'equipment',
+    sub_type: 'armor',
+    effect: { defense: 22, max_hp: 50 },
+  },
+  lucky_ring: {
+    item_id: 'lucky_ring',
+    name: '幸运戒指',
+    type: 'equipment',
+    sub_type: 'accessory',
+    effect: { drop_rate_boost: 0.1 },
+  },
+  warrior_amulet: {
+    item_id: 'warrior_amulet',
+    name: '勇士护符',
+    type: 'equipment',
+    sub_type: 'accessory',
+    effect: { attack: 3, defense: 3, max_hp: 20 },
+  },
+  leather_scrap: {
+    item_id: 'leather_scrap',
+    name: '皮革碎片',
+    type: 'material',
+  },
+  iron_ore: {
+    item_id: 'iron_ore',
+    name: '铁矿石',
+    type: 'material',
+  },
+  wolf_fang: {
+    item_id: 'wolf_fang',
+    name: '狼牙',
+    type: 'material',
+  },
+  orc_shield_fragment: {
+    item_id: 'orc_shield_fragment',
+    name: '兽人盾碎片',
+    type: 'material',
+  },
+  dragon_scale: {
+    item_id: 'dragon_scale',
+    name: '龙鳞',
+    type: 'material',
+  },
+  flame_gem: {
+    item_id: 'flame_gem',
+    name: '火焰宝石',
+    type: 'material',
+  },
+};
+
+// Monster spawn positions in the game world (1600x1200)
+export const MONSTER_SPAWNS = [
+  // 史莱姆草地
+  { monster_id: 'slime_01', x: 200, y: 200 },
+  { monster_id: 'slime_01', x: 280, y: 550 },
+  // 哥布林森林
+  { monster_id: 'goblin_01', x: 600, y: 200 },
+  { monster_id: 'goblin_01', x: 900, y: 300 },
+  // 灰狼山地
+  { monster_id: 'wolf_01', x: 600, y: 500 },
+  { monster_id: 'wolf_01', x: 1100, y: 750 },
+  // 兽人营地
+  { monster_id: 'orc_01', x: 1300, y: 850 },
+  { monster_id: 'orc_01', x: 1400, y: 920 },
+  // 幼龙巢穴
+  { monster_id: 'dragon_01', x: 1350, y: 1050 },
+  { monster_id: 'dragon_01', x: 1450, y: 1100 },
+];
+
+// Player initial state
+export const PLAYER_INITIAL = {
+  player_id: 'local_player',
+  name: '勇者',
+  level: 1,
+  exp: 0,
+  exp_to_next_level: 50,
+  gold: 0,
+  hp: 100,
+  max_hp: 100,
+  attack: 15,
+  defense: 5,
+  inventory: [],
+  active_tasks: [],
+  completed_tasks: [],
+  position_x: 400,
+  position_y: 300,
+};

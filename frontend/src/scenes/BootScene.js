@@ -154,7 +154,7 @@ export default class BootScene extends Phaser.Scene {
     gfx.destroy();
   }
 
-  /* Slime — green blob with gel highlight */
+  /* Slime — humanoid slime creature */
   drawSlime(gfx, scale = 1) {
     const palette = {
       g: 0x228833, // dark green outline
@@ -162,25 +162,26 @@ export default class BootScene extends Phaser.Scene {
       L: 0x66ee77, // light green
       w: 0xeeffee, // white highlight
       e: 0x222222, // eye
-      m: 0x228833, // mouth
+      m: 0xff4444, // mouth
+      d: 0x337744, // dark limbs
     };
     const map = [
-      '................',
-      '......ggg.......',
-      '....ggGGGgg.....',
-      '...gGwwGGGGg....',
-      '..gGwwGGGGGGg...',
-      '..gGLGGGGGGGg...',
-      '.gGGGGGGGGGGGg..',
-      '.gGGeGGGGeGGGg..',
-      '.gGGGGGGGGGGGg..',
-      '.gGGGGGGGGGGGg..',
-      '..gGGmmmGGGGg...',
-      '..gGGGGGGGGGg...',
-      '...gGGGGGGGg....',
+      '......gggg......',
+      '.....gGwGGg.....',
+      '.....gGGGGg.....',
+      '.....geGGeG.....',
+      '.....gGmmGg.....',
+      '......gGGg......',
       '....ggGGGGgg....',
-      '.....gggggg.....',
-      '................',
+      '...gGGGGGGGGg...',
+      '..dGGGGGGGGGGd..',
+      '..dLGGGGGGGGLd..',
+      '...dGGGGGGGGd...',
+      '....gGGGGGGg....',
+      '....gGGGGGGg....',
+      '....gGGg.gGg....',
+      '....gdg...gdg...',
+      '....dd.....dd...',
     ];
     this.drawPixelArt(gfx, map, palette, scale);
   }

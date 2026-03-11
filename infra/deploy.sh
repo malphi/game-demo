@@ -306,7 +306,7 @@ deploy_agentcore() {
       --agent-runtime-artifact "{\"containerConfiguration\": {\"containerUri\": \"${container_uri}\"}}" \
       --role-arn "${agentcore_role_arn}" \
       --network-configuration "${vpc_network_config}" \
-      --environment-variables "{\"BEDROCK_MODEL_ID\": \"us.anthropic.claude-3-5-haiku-20241022-v1:0\", \"BEDROCK_REGION\": \"${REGION}\", \"AWS_REGION\": \"${REGION}\", \"ENV\": \"${ENV}\"}" \
+      --environment-variables "{\"BEDROCK_MODEL_ID\": \"us.anthropic.claude-4-5-haiku-20251001-v1:0\", \"BEDROCK_REGION\": \"${REGION}\", \"AWS_REGION\": \"${REGION}\", \"ENV\": \"${ENV}\"}" \
       --protocol-configuration '{"serverProtocol": "HTTP"}' \
       --query 'agentRuntimeId' \
       --output text --region "${REGION}")
@@ -318,7 +318,7 @@ deploy_agentcore() {
       --agent-runtime-artifact "{\"containerConfiguration\": {\"containerUri\": \"${container_uri}\"}}" \
       --role-arn "${agentcore_role_arn}" \
       --network-configuration "${vpc_network_config}" \
-      --environment-variables "{\"BEDROCK_MODEL_ID\": \"us.anthropic.claude-3-5-haiku-20241022-v1:0\", \"BEDROCK_REGION\": \"${REGION}\", \"AWS_REGION\": \"${REGION}\", \"ENV\": \"${ENV}\"}" \
+      --environment-variables "{\"BEDROCK_MODEL_ID\": \"us.anthropic.claude-4-5-haiku-20251001-v1:0\", \"BEDROCK_REGION\": \"${REGION}\", \"AWS_REGION\": \"${REGION}\", \"ENV\": \"${ENV}\"}" \
       --region "${REGION}" > /dev/null
     echo "    AgentCore runtime updated."
   fi

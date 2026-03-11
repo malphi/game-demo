@@ -42,7 +42,7 @@ SYSTEM_PROMPT_TEMPLATE = (PROMPT_DIR / "npc_system_prompt.txt").read_text(encodi
 
 # ---- Bedrock model configuration ----
 BEDROCK_MODEL_ID = os.environ.get(
-    "BEDROCK_MODEL_ID", "us.anthropic.claude-3-5-haiku-20241022-v1:0"
+    "BEDROCK_MODEL_ID", "us.anthropic.claude-4-5-haiku-20251001-v1:0"
 )
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-west-2")
 
@@ -282,7 +282,7 @@ def handle_npc_dialogue_core(player_id: str, npc_id: str) -> dict:
     npc_info = resp["Item"]
     logger.info(f"NPC found: {npc_info['name']} ({npc_id})")
 
-    # 2. 检查未完成任务
+    # 2. 检查未完成任务（in_progress 或 pending 都直接返回，不调 LLM）
     try:
         tasks_table = dynamodb.Table(table_name("Tasks"))
         tasks_resp = tasks_table.query(
@@ -293,19 +293,23 @@ def handle_npc_dialogue_core(player_id: str, npc_id: str) -> dict:
         for item in tasks_resp.get("Items", []):
             if item.get("npc_id") != npc_id:
                 continue
-            if item.get("status") == "in_progress":
-                logger.info(f"Player {player_id} has in_progress task from {npc_id}")
+            status = item.get("status")
+            if status in ("in_progress", "pending"):
+                task_title = item.get("title", "")
+                task_desc = item.get("description", "")
+                logger.info(f"Player {player_id} has {status} task '{task_title}' from {npc_id}, skipping LLM")
+                if status == "in_progress":
+                    dialogue = f"你还没完成我交给你的任务「{task_title}」呢！{task_desc}，快去吧！"
+                else:
+                    dialogue = f"我刚才给你说的任务「{task_title}」，你还没接受呢，要不要接？"
                 return {
-                    "dialogue": "继续完成我交给你的任务吧！",
+                    "dialogue": dialogue,
                     "npc_id": npc_id,
                     "npc_name": npc_info["name"],
                     "player_id": player_id,
-                    "task": None,
+                    "task": _convert_decimals(item) if status == "pending" else None,
                     "debug_log": [],
                 }
-            elif item.get("status") == "pending":
-                logger.info(f"Deleting stale pending task {item['task_id']}")
-                tasks_table.delete_item(Key={"task_id": item["task_id"]})
     except Exception as e:
         logger.warning(f"Failed to check active tasks: {e}")
 
@@ -336,20 +340,30 @@ def handle_npc_dialogue_core(player_id: str, npc_id: str) -> dict:
         ev_lines = [f"{ev.get('event_type','')}:{ev.get('target_id','')}={ev.get('result','')}" for ev in data["player_events"][:10]]
         events_str = "; ".join(ev_lines)
 
-    tasks_str = "无"
+    completed_tasks_str = "无"
+    active_tasks_str = "无"
     if data["player_tasks"]:
-        t_lines = []
+        completed_lines = []
+        active_lines = []
         for t in data["player_tasks"]:
             conds = ",".join(f"{c['type']}:{c['target_id']}" for c in t.get("conditions",[]))
-            t_lines.append(f"{t.get('status','')}|{conds}")
-        tasks_str = "; ".join(t_lines)
+            entry = f"{t.get('title','未知')}({conds})"
+            if t.get("status") == "completed":
+                completed_lines.append(entry)
+            else:
+                active_lines.append(f"{t.get('status','')}|{entry}")
+        if completed_lines:
+            completed_tasks_str = "; ".join(completed_lines)
+        if active_lines:
+            active_tasks_str = "; ".join(active_lines)
 
     user_message = f"""玩家 {player_id} 来找你对话。
 
 玩家: {player_summary}
 背包: {inv_str}
 最近事件: {events_str}
-已有任务: {tasks_str}
+已完成任务: {completed_tasks_str}
+进行中任务: {active_tasks_str}
 怪物: {json.dumps(monsters_slim, ensure_ascii=False)}
 道具: {json.dumps(items_slim, ensure_ascii=False)}
 NPC: {json.dumps(npcs_slim, ensure_ascii=False)}"""
