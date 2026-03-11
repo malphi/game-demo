@@ -316,6 +316,7 @@ deploy_agentcore() {
     aws bedrock-agentcore-control update-agent-runtime \
       --agent-runtime-id "${runtime_id}" \
       --agent-runtime-artifact "{\"containerConfiguration\": {\"containerUri\": \"${container_uri}\"}}" \
+      --role-arn "${agentcore_role_arn}" \
       --network-configuration "${vpc_network_config}" \
       --environment-variables "{\"BEDROCK_MODEL_ID\": \"us.anthropic.claude-3-5-haiku-20241022-v1:0\", \"BEDROCK_REGION\": \"${REGION}\", \"AWS_REGION\": \"${REGION}\", \"ENV\": \"${ENV}\"}" \
       --region "${REGION}" > /dev/null
