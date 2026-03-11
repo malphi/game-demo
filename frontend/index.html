@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Game Demo - 2D RPG</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      background: #111;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      min-height: 100vh;
+      padding: 10px;
+      gap: 10px;
+    }
+    #game-container {
+      border: 2px solid #333;
+      border-radius: 4px;
+      flex-shrink: 0;
+    }
+    #agent-console {
+      width: 420px;
+      height: 604px;
+      border: 2px solid #333;
+      border-radius: 4px;
+      background: #0a0a0a;
+      display: flex;
+      flex-direction: column;
+      font-family: 'Courier New', monospace;
+      flex-shrink: 0;
+    }
+    #agent-console-header {
+      background: #1a1a2e;
+      color: #4488ff;
+      padding: 6px 12px;
+      font-size: 13px;
+      font-weight: bold;
+      border-bottom: 1px solid #333;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    #agent-console-header button {
+      background: none;
+      border: 1px solid #555;
+      color: #888;
+      padding: 2px 8px;
+      font-size: 11px;
+      cursor: pointer;
+      border-radius: 3px;
+    }
+    #agent-console-header button:hover {
+      color: #fff;
+      border-color: #888;
+    }
+    #reset-btn {
+      border-color: #cc4444 !important;
+      color: #cc4444 !important;
+    }
+    #reset-btn:hover {
+      color: #ff6666 !important;
+      border-color: #ff6666 !important;
+    }
+    #agent-console-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #ccc;
+    }
+    #agent-console-body::-webkit-scrollbar {
+      width: 6px;
+    }
+    #agent-console-body::-webkit-scrollbar-track {
+      background: #0a0a0a;
+    }
+    #agent-console-body::-webkit-scrollbar-thumb {
+      background: #333;
+      border-radius: 3px;
+    }
+    .log-entry {
+      margin-bottom: 4px;
+      border-bottom: 1px solid #1a1a1a;
+      padding-bottom: 4px;
+    }
+    .log-entry:last-child {
+      border-bottom: none;
+    }
+    .log-session {
+      border-bottom: 2px solid #2a2a4e;
+      margin-bottom: 8px;
+      padding-bottom: 8px;
+    }
+    .log-header {
+      color: #4488ff;
+      font-weight: bold;
+      margin-bottom: 4px;
+    }
+    .log-tool-call {
+      color: #44cc88;
+    }
+    .log-tool-name {
+      color: #88ffaa;
+      font-weight: bold;
+    }
+    .log-tool-result {
+      color: #999;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 120px;
+      overflow-y: auto;
+      background: #111;
+      padding: 3px 6px;
+      border-radius: 3px;
+      margin: 2px 0;
+      font-size: 11px;
+    }
+    .log-reasoning {
+      color: #ffaa44;
+      font-style: italic;
+    }
+    .log-timing {
+      color: #88ddff;
+      font-size: 11px;
+      border-left: 2px solid #88ddff;
+      padding-left: 6px;
+    }
+    .log-time {
+      color: #555;
+      font-size: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div id="game-container"></div>
+  <div id="agent-console">
+    <div id="agent-console-header">
+      <span>Agent Console</span>
+      <div>
+        <button id="reset-btn" onclick="resetGame()">Reset</button>
+        <button onclick="document.getElementById('agent-console-body').innerHTML=''">Clear</button>
+      </div>
+    </div>
+    <div id="agent-console-body"></div>
+  </div>
+  <script>
+    async function resetGame() {
+      if (!confirm('确定要重置游戏吗？所有玩家数据、任务和事件记录将被清除。')) return;
+      const btn = document.getElementById('reset-btn');
+      btn.textContent = '...';
+      btn.disabled = true;
+      try {
+        const isDev = ['localhost', '127.0.0.1'].includes(window.location.hostname)
+          && ['3000', '3001'].includes(window.location.port);
+        const baseUrl = isDev ? `http://${window.location.hostname}:8080` : '';
+        const resp = await fetch(`${baseUrl}/api/game/reset`, { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) {
+          document.getElementById('agent-console-body').innerHTML = '';
+          window.location.reload();
+        } else {
+          alert('重置失败: ' + data.message);
+        }
+      } catch (err) {
+        alert('重置失败: ' + err.message);
+      } finally {
+        btn.textContent = 'Reset';
+        btn.disabled = false;
+      }
+    }
+  </script>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
