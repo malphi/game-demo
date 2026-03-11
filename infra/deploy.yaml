@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Game Demo - Full AWS deployment stack.
   Includes VPC (with VPC Endpoints), EC2 (frontend + backend),
-  DynamoDB tables, Kinesis, and IAM roles.
+  DynamoDB tables, and IAM roles.
 
 # =============================================================================
 # Parameters
@@ -407,15 +407,6 @@ Resources:
                   - !Sub '${TasksTable.Arn}/index/*'
                   - !GetAtt PlayerEventSummaryTable.Arn
                   - !Sub '${PlayerEventSummaryTable.Arn}/index/*'
-        - PolicyName: KinesisAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - kinesis:PutRecord
-                  - kinesis:PutRecords
-                Resource: !GetAtt GameEventStream.Arn
         - PolicyName: AgentCoreAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -741,106 +732,6 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-  # ===========================================================================
-  # Kinesis Data Stream
-  # ===========================================================================
-
-  GameEventStream:
-    Type: AWS::Kinesis::Stream
-    Properties:
-      Name: !Sub 'GameEventStream-${Environment}'
-      ShardCount: 1
-      StreamModeDetails:
-        StreamMode: PROVISIONED
-      Tags:
-        - Key: Project
-          Value: game-demo
-        - Key: Environment
-          Value: !Ref Environment
-
-  # ===========================================================================
-  # S3 Bucket for behavior log storage (Kinesis Firehose destination)
-  # ===========================================================================
-
-  GameDemoLogsBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub 'game-demo-logs-${AWS::AccountId}-${Environment}'
-      LifecycleConfiguration:
-        Rules:
-          - Id: TransitionToIA
-            Status: Enabled
-            Transitions:
-              - StorageClass: STANDARD_IA
-                TransitionInDays: 30
-          - Id: ExpireOldLogs
-            Status: Enabled
-            ExpirationInDays: 365
-      Tags:
-        - Key: Project
-          Value: game-demo
-        - Key: Environment
-          Value: !Ref Environment
-
-  # ===========================================================================
-  # Kinesis Firehose → S3
-  # ===========================================================================
-
-  FirehoseDeliveryRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub 'game-demo-firehose-${Environment}'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: firehose.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: FirehoseS3Access
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:PutObject
-                  - s3:PutObjectAcl
-                  - s3:GetBucketLocation
-                  - s3:ListBucket
-                Resource:
-                  - !GetAtt GameDemoLogsBucket.Arn
-                  - !Sub '${GameDemoLogsBucket.Arn}/*'
-        - PolicyName: FirehoseKinesisAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - kinesis:DescribeStream
-                  - kinesis:GetShardIterator
-                  - kinesis:GetRecords
-                  - kinesis:ListShards
-                Resource: !GetAtt GameEventStream.Arn
-
-  GameEventFirehose:
-    Type: AWS::KinesisFirehose::DeliveryStream
-    Properties:
-      DeliveryStreamName: !Sub 'game-demo-firehose-${Environment}'
-      DeliveryStreamType: KinesisStreamAsSource
-      KinesisStreamSourceConfiguration:
-        KinesisStreamARN: !GetAtt GameEventStream.Arn
-        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
-      S3DestinationConfiguration:
-        BucketARN: !GetAtt GameDemoLogsBucket.Arn
-        Prefix: !Sub 'game-events/${Environment}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
-        ErrorOutputPrefix: !Sub 'game-events-errors/${Environment}/'
-        BufferingHints:
-          IntervalInSeconds: 300
-          SizeInMBs: 5
-        CompressionFormat: GZIP
-        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
-
 # =============================================================================
 # Outputs
 # =============================================================================
@@ -885,14 +776,6 @@ Outputs:
   PlayerEventSummaryTableName:
     Description: Name of the PlayerEventSummary DynamoDB table
     Value: !Ref PlayerEventSummaryTable
-
-  GameEventStreamName:
-    Description: Kinesis stream name
-    Value: !Ref GameEventStream
-
-  GameDemoLogsBucketName:
-    Description: S3 bucket for game event logs
-    Value: !Ref GameDemoLogsBucket
 
   AgentCoreArtifactBucketName:
     Description: S3 bucket for AgentCore NPC agent code artifacts

@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Game Demo Infrastructure - DynamoDB tables
+  for a 2D RPG game with AI-driven NPC task generation.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+Resources:
+  # =============================================================
+  # DynamoDB Tables
+  # =============================================================
+
+  PlayersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'Players-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: player_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: player_id
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+  MonstersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'Monsters-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: monster_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: monster_id
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+  NPCsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'NPCs-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: npc_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: npc_id
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+  ItemsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'Items-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: item_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: item_id
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'Tasks-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: task_id
+          AttributeType: S
+        - AttributeName: player_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: task_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: player_id-index
+          KeySchema:
+            - AttributeName: player_id
+              KeyType: HASH
+            - AttributeName: status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+  PlayerEventSummaryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'PlayerEventSummary-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: player_id
+          AttributeType: S
+        - AttributeName: event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: player_id
+          KeyType: HASH
+        - AttributeName: event_id
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: game-demo
+        - Key: Environment
+          Value: !Ref Environment
+
+# =============================================================
+# Outputs
+# =============================================================
+
+Outputs:
+  PlayersTableName:
+    Description: Name of the Players DynamoDB table
+    Value: !Ref PlayersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PlayersTableName'
+
+  PlayersTableArn:
+    Description: ARN of the Players DynamoDB table
+    Value: !GetAtt PlayersTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PlayersTableArn'
+
+  MonstersTableName:
+    Description: Name of the Monsters DynamoDB table
+    Value: !Ref MonstersTable
+    Export:
+      Name: !Sub '${AWS::StackName}-MonstersTableName'
+
+  MonstersTableArn:
+    Description: ARN of the Monsters DynamoDB table
+    Value: !GetAtt MonstersTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MonstersTableArn'
+
+  NPCsTableName:
+    Description: Name of the NPCs DynamoDB table
+    Value: !Ref NPCsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-NPCsTableName'
+
+  NPCsTableArn:
+    Description: ARN of the NPCs DynamoDB table
+    Value: !GetAtt NPCsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NPCsTableArn'
+
+  ItemsTableName:
+    Description: Name of the Items DynamoDB table
+    Value: !Ref ItemsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ItemsTableName'
+
+  ItemsTableArn:
+    Description: ARN of the Items DynamoDB table
+    Value: !GetAtt ItemsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ItemsTableArn'
+
+  TasksTableName:
+    Description: Name of the Tasks DynamoDB table
+    Value: !Ref TasksTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TasksTableName'
+
+  TasksTableArn:
+    Description: ARN of the Tasks DynamoDB table
+    Value: !GetAtt TasksTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TasksTableArn'
+
+  PlayerEventSummaryTableName:
+    Description: Name of the PlayerEventSummary DynamoDB table
+    Value: !Ref PlayerEventSummaryTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PlayerEventSummaryTableName'
+
+  PlayerEventSummaryTableArn:
+    Description: ARN of the PlayerEventSummary DynamoDB table
+    Value: !GetAtt PlayerEventSummaryTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PlayerEventSummaryTableArn'
+
