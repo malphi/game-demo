@@ -1,16 +1,40 @@
 const playerDataService = require('../services/PlayerDataService');
 const eventEmitter = require('../services/EventEmitter');
+const { getNPC } = require('../models/NPC');
+const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient, QueryCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
+
+const ddbConfig = { region: process.env.AWS_REGION || 'us-west-2' };
+if (process.env.DYNAMODB_ENDPOINT) {
+  ddbConfig.endpoint = process.env.DYNAMODB_ENDPOINT;
+}
+const docClient = DynamoDBDocumentClient.from(new DynamoDBClient(ddbConfig));
+const env = process.env.ENV || '';
+const tasksTableName = env ? `Tasks-${env}` : 'Tasks';
 
 /**
  * NPC dialogue handler for WebSocket messages.
  *
- * Calls the NPC Agent deployed on AWS AgentCore Runtime.
- * The NPC Agent reads game data from DynamoDB, calls Bedrock LLM,
- * and returns dialogue + task based on player state.
+ * First checks DynamoDB for existing tasks from this NPC.
+ * Only calls AgentCore (LLM) when no active task exists.
  */
 
 /**
- * Handle NPC dialogue start — calls NPC Agent via AgentCore.
+ * Query tasks for a player from a specific NPC.
+ */
+async function getPlayerTasksFromNPC(playerId, npcId) {
+  const resp = await docClient.send(new QueryCommand({
+    TableName: tasksTableName,
+    IndexName: 'player_id-index',
+    KeyConditionExpression: 'player_id = :pid',
+    ExpressionAttributeValues: { ':pid': playerId },
+  }));
+  return (resp.Items || []).filter(t => t.npc_id === npcId);
+}
+
+/**
+ * Handle NPC dialogue start.
+ * Checks for existing tasks first; only calls AgentCore if none found.
  */
 async function handleNPCDialogue(ws, message) {
   const { player_id, npc_id } = message;
@@ -21,6 +45,12 @@ async function handleNPCDialogue(ws, message) {
     return;
   }
 
+  const npc = getNPC(npc_id);
+  if (!npc) {
+    ws.send(JSON.stringify({ type: 'error', message: `NPC not found: ${npc_id}` }));
+    return;
+  }
+
   // Auto-create player in DynamoDB if not found
   let player = await playerDataService.getPlayer(player_id);
   if (!player) {
@@ -28,7 +58,41 @@ async function handleNPCDialogue(ws, message) {
     player = await playerDataService.createPlayer(player_id, player_id);
   }
 
-  // Call NPC Agent via AgentCore
+  // Check existing tasks from this NPC — skip AgentCore if found
+  try {
+    const npcTasks = await getPlayerTasksFromNPC(player_id, npc_id);
+    for (const task of npcTasks) {
+      const status = task.status;
+      if (status === 'in_progress') {
+        console.log(`[HANDLER] Player has in_progress task '${task.title}' from ${npc_id}, skipping AgentCore`);
+        ws.send(JSON.stringify({
+          type: 'npc_dialogue_response',
+          npc_id,
+          npc_name: npc.name,
+          dialogue: `你还没完成我交给你的任务「${task.title}」呢！${task.description}，快去吧！`,
+          task: null,
+          debug_log: [],
+        }));
+        return;
+      }
+      if (status === 'pending') {
+        console.log(`[HANDLER] Player has pending task '${task.title}' from ${npc_id}, skipping AgentCore`);
+        ws.send(JSON.stringify({
+          type: 'npc_dialogue_response',
+          npc_id,
+          npc_name: npc.name,
+          dialogue: `我刚才给你说的任务「${task.title}」，你还没接受呢，要不要接？`,
+          task: task,
+          debug_log: [],
+        }));
+        return;
+      }
+    }
+  } catch (err) {
+    console.warn(`[HANDLER] Failed to check existing tasks: ${err.message}`);
+  }
+
+  // No active task from this NPC — call AgentCore for new dialogue + task
   let dialogueResult;
   try {
     dialogueResult = await callNPCAgentAgentCore(player_id, npc_id);
@@ -43,14 +107,14 @@ async function handleNPCDialogue(ws, message) {
 
   // Log the NPC dialogue event
   eventEmitter.logEvent(player_id, 'talk_to_npc', npc_id, 'success', {
-    npc_name: dialogueResult.npc_name || npc_id,
+    npc_name: npc.name,
   });
 
   // Send dialogue response
   const dialogueMsg = {
     type: 'npc_dialogue_response',
     npc_id: dialogueResult.npc_id || npc_id,
-    npc_name: dialogueResult.npc_name || npc_id,
+    npc_name: dialogueResult.npc_name || npc.name,
     dialogue: dialogueResult.dialogue,
     task: dialogueResult.task || null,
     debug_log: dialogueResult.debug_log || [],
@@ -61,10 +125,11 @@ async function handleNPCDialogue(ws, message) {
 
 /**
  * Handle task acceptance — update DynamoDB task status.
+ * Enforces: one active task per NPC per player.
  */
 async function handleTaskAccept(ws, message) {
-  const { player_id, task_id } = message;
-  console.log(`[HANDLER] task_accept: player=${player_id}, task=${task_id}`);
+  const { player_id, task_id, npc_id } = message;
+  console.log(`[HANDLER] task_accept: player=${player_id}, task=${task_id}, npc=${npc_id}`);
 
   if (!player_id || !task_id) {
     ws.send(JSON.stringify({ type: 'error', message: 'player_id and task_id are required' }));
@@ -77,18 +142,24 @@ async function handleTaskAccept(ws, message) {
     return;
   }
 
+  // Check: only one active task per NPC
+  if (npc_id) {
+    try {
+      const npcTasks = await getPlayerTasksFromNPC(player_id, npc_id);
+      const existing = npcTasks.find(t => t.status === 'in_progress');
+      if (existing) {
+        console.log(`[HANDLER] Player already has in_progress task from ${npc_id}, rejecting accept`);
+        ws.send(JSON.stringify({ type: 'error', message: '你已经有这个NPC的进行中任务了' }));
+        return;
+      }
+    } catch (err) {
+      console.warn(`[HANDLER] Failed to check NPC task constraint: ${err.message}`);
+    }
+  }
+
   // Update task status in DynamoDB to "in_progress"
   try {
-    const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-    const { DynamoDBDocumentClient, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
-    const config = { region: process.env.AWS_REGION || 'us-west-2' };
-    if (process.env.DYNAMODB_ENDPOINT) {
-      config.endpoint = process.env.DYNAMODB_ENDPOINT;
-    }
-    const client = new DynamoDBClient(config);
-    const docClient = DynamoDBDocumentClient.from(client);
-    const env = process.env.ENV || '';
-    const tasksTableName = env ? `Tasks-${env}` : 'Tasks';
+    const { UpdateCommand } = require('@aws-sdk/lib-dynamodb');
     await docClient.send(new UpdateCommand({
       TableName: tasksTableName,
       Key: { task_id },

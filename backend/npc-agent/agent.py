@@ -282,38 +282,7 @@ def handle_npc_dialogue_core(player_id: str, npc_id: str) -> dict:
     npc_info = resp["Item"]
     logger.info(f"NPC found: {npc_info['name']} ({npc_id})")
 
-    # 2. 检查未完成任务（in_progress 或 pending 都直接返回，不调 LLM）
-    try:
-        tasks_table = dynamodb.Table(table_name("Tasks"))
-        tasks_resp = tasks_table.query(
-            IndexName="player_id-index",
-            KeyConditionExpression="player_id = :pid",
-            ExpressionAttributeValues={":pid": player_id},
-        )
-        for item in tasks_resp.get("Items", []):
-            if item.get("npc_id") != npc_id:
-                continue
-            status = item.get("status")
-            if status in ("in_progress", "pending"):
-                task_title = item.get("title", "")
-                task_desc = item.get("description", "")
-                logger.info(f"Player {player_id} has {status} task '{task_title}' from {npc_id}, skipping LLM")
-                if status == "in_progress":
-                    dialogue = f"你还没完成我交给你的任务「{task_title}」呢！{task_desc}，快去吧！"
-                else:
-                    dialogue = f"我刚才给你说的任务「{task_title}」，你还没接受呢，要不要接？"
-                return {
-                    "dialogue": dialogue,
-                    "npc_id": npc_id,
-                    "npc_name": npc_info["name"],
-                    "player_id": player_id,
-                    "task": _convert_decimals(item) if status == "pending" else None,
-                    "debug_log": [],
-                }
-    except Exception as e:
-        logger.warning(f"Failed to check active tasks: {e}")
-
-    # 3. 预获取所有数据
+    # 2. 预获取所有数据
     prefetch_start = time.time()
     data = prefetch_all_data(player_id)
     prefetch_ms = round((time.time() - prefetch_start) * 1000)
