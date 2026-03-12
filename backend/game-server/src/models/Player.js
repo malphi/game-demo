@@ -4,7 +4,7 @@ const PLAYER_DEFAULTS = {
   name: '勇者',
   level: 1,
   exp: 0,
-  exp_to_next_level: 50,
+  exp_to_next_level: 10,
   gold: 0,
   hp: 100,
   max_hp: 100,
@@ -35,10 +35,11 @@ function createPlayerData(name, playerId) {
 
 /**
  * Calculate exp required for next level.
- * Formula: 50 * level^1.5 (rounded)
+ * Matches same-level monster exp_reward so one kill = one level up.
  */
 function expForLevel(level) {
-  return Math.round(50 * Math.pow(level, 1.5));
+  const expMap = { 1: 10, 2: 25, 3: 45, 4: 80, 5: 150 };
+  return expMap[level] || level * 30;
 }
 
 /**
@@ -52,10 +53,10 @@ function tryLevelUp(player) {
     player.level += 1;
     player.exp_to_next_level = expForLevel(player.level);
     // Stat boosts on level up
-    player.max_hp += 20;
+    player.max_hp += 10;
     player.hp = player.max_hp;
-    player.attack += 5;
-    player.defense += 2;
+    player.attack += 3;
+    player.defense += 1;
     leveled = true;
   }
   return leveled;

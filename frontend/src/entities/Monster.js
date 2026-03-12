@@ -24,12 +24,12 @@ export default class Monster extends Phaser.GameObjects.Sprite {
     this.respawnTimer = null;
 
     this.body.setImmovable(true);
-    this.setScale(2);
+    this.setScale(1);
     this.setDepth(5);
 
-    // Create floating name + level label (offset accounts for 2x scale)
+    // Create floating name + level label
     this.nameLabel = scene.add
-      .text(x, y - template.size - 14, `Lv.${this.level} ${this.monsterName}`, {
+      .text(x, y - template.size / 2 - 6, `Lv.${this.level} ${this.monsterName}`, {
         fontSize: '10px',
         fontFamily: 'Arial',
         color: '#ff6666',
@@ -65,14 +65,14 @@ export default class Monster extends Phaser.GameObjects.Sprite {
     this.setVisible(true);
     this.body.enable = true;
     this.nameLabel.setVisible(true);
-    this.nameLabel.setPosition(this.spawnX, this.spawnY - MONSTER_DICT[this.monster_id].size - 14);
+    this.nameLabel.setPosition(this.spawnX, this.spawnY - MONSTER_DICT[this.monster_id].size / 2 - 6);
   }
 
   update() {
     if (!this.isDead) {
       this.nameLabel.setPosition(
         this.x,
-        this.y - MONSTER_DICT[this.monster_id].size - 14
+        this.y - MONSTER_DICT[this.monster_id].size / 2 - 6
       );
     }
   }

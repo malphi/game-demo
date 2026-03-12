@@ -70,7 +70,20 @@ def _normalize_conditions(conditions: list) -> list:
     return sorted(normalized)
 
 
-def validate_task(task_data: dict) -> dict:
+def _get_monster_level(monster_id: str) -> int | None:
+    """获取怪物等级。"""
+    try:
+        table = dynamodb.Table(table_name("Monsters"))
+        resp = table.get_item(Key={"monster_id": monster_id})
+        item = resp.get("Item")
+        if item:
+            return int(item.get("level", 0))
+    except Exception as e:
+        logger.error(f"Failed to get monster level for {monster_id}: {e}")
+    return None
+
+
+def validate_task(task_data: dict, player_level: int = None) -> dict:
     """
     校验任务数据的合法性。
 
@@ -135,6 +148,12 @@ def validate_task(task_data: dict) -> dict:
                     errors.append(
                         f"target_id 不存在: {target_id}（表: {target_table}）"
                     )
+                elif cond_type == "kill_monster" and player_level is not None:
+                    monster_level = _get_monster_level(target_id)
+                    if monster_level is not None and monster_level != player_level:
+                        errors.append(
+                            f"kill_monster 目标怪物等级({monster_level})与玩家等级({player_level})不匹配"
+                        )
 
             # 3c. required_count 范围校验
             required_count = cond.get("required_count")

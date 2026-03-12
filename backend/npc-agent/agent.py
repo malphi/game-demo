@@ -203,7 +203,7 @@ def parse_llm_json(text: str) -> dict:
     return json.loads(text)
 
 
-def create_task_from_json(player_id: str, npc_id: str, task_json: dict) -> dict:
+def create_task_from_json(player_id: str, npc_id: str, task_json: dict, player_level: int = None) -> dict:
     """Validate and write task to DynamoDB from LLM JSON output."""
     import uuid
     from datetime import datetime, timezone
@@ -218,7 +218,7 @@ def create_task_from_json(player_id: str, npc_id: str, task_json: dict) -> dict:
     }
 
     # Validate
-    validation = validate_task(task_data)
+    validation = validate_task(task_data, player_level=player_level)
     if not validation["valid"]:
         logger.warning(f"Task validation failed: {validation['reason']}")
         return {"success": False, "reason": validation["reason"]}
@@ -298,8 +298,11 @@ def handle_npc_dialogue_core(player_id: str, npc_id: str) -> dict:
     inv = p.get("inventory", [])
     inv_str = ", ".join(f"{i['item_id']}x{i['quantity']}" for i in inv) if inv else "空"
 
+    player_level = int(p.get("level", 1))
     monsters_slim = [{"id": m["monster_id"], "name": m.get("name",""), "lv": int(m.get("level",1))} for m in data["monsters"]]
     monsters_slim.sort(key=lambda x: x["lv"])
+    # Filter to only show player-level monster for kill tasks
+    level_matched_monsters = [m for m in monsters_slim if m["lv"] == player_level]
 
     items_slim = [{"id": i["item_id"], "name": i.get("name",""), "type": i.get("type","")} for i in data["items"]]
     npcs_slim = [{"id": n["npc_id"], "name": n.get("name","")} for n in data["npcs"]]
@@ -333,7 +336,7 @@ def handle_npc_dialogue_core(player_id: str, npc_id: str) -> dict:
 最近事件: {events_str}
 已完成任务: {completed_tasks_str}
 进行中任务: {active_tasks_str}
-怪物: {json.dumps(monsters_slim, ensure_ascii=False)}
+可击杀怪物(仅限玩家同等级): {json.dumps(level_matched_monsters, ensure_ascii=False)}
 道具: {json.dumps(items_slim, ensure_ascii=False)}
 NPC: {json.dumps(npcs_slim, ensure_ascii=False)}"""
 
@@ -391,7 +394,7 @@ NPC: {json.dumps(npcs_slim, ensure_ascii=False)}"""
                 "name": "create_task",
                 "input": task_json,
             })
-            create_result = create_task_from_json(player_id, npc_id, task_json)
+            create_result = create_task_from_json(player_id, npc_id, task_json, player_level=player_level)
             if create_result["success"]:
                 task_obj = _convert_decimals(create_result["task"])
                 debug_log.append({

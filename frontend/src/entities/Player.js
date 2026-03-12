@@ -78,11 +78,12 @@ export default class Player extends Phaser.GameObjects.Sprite {
     while (this.exp >= this.exp_to_next_level) {
       this.exp -= this.exp_to_next_level;
       this.level++;
-      this.max_hp += 20;
+      this.max_hp += 10;
       this.hp = this.max_hp;
-      this.attackStat += 5;
-      this.defenseStat += 2;
-      this.exp_to_next_level = Math.floor(this.exp_to_next_level * 1.5);
+      this.attackStat += 3;
+      this.defenseStat += 1;
+      const expMap = { 1: 10, 2: 25, 3: 45, 4: 80, 5: 150 };
+      this.exp_to_next_level = expMap[this.level] || this.level * 30;
       leveledUp = true;
     }
     if (leveledUp) {
