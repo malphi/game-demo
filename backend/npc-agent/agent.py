@@ -1,8 +1,9 @@
 """
 NPC AI Agent 主入口模块。
 
-基于 Amazon Bedrock 大模型驱动，预获取所有数据后一次性调用 LLM，
-LLM 直接输出 JSON（包含任务和对话），无需工具调用，实现单次 API 请求完成。
+基于 Strands Agent SDK + Amazon Bedrock 驱动，使用 Tool Use 模式，
+LLM 自主决定调用哪些工具（查询玩家、查询字典、创建任务等）。
+集成 AgentCore Memory 实现有状态 NPC 对话。
 
 Usage:
     python agent.py
@@ -12,16 +13,25 @@ Usage:
 import os
 import json
 import logging
-import decimal
 import time
-import re
+import decimal
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
-import boto3
+from strands import Agent
+from strands.models.bedrock import BedrockModel
+from strands.handlers import null_callback_handler
+
+from tools import (
+    create_task,
+)
+from memory_config import create_session_manager
+from db_config import dynamodb, table_name
+from kb_client import reset_call_log, get_call_log, query_knowledge_base, BEDROCK_KB_ID
 
 # ---- Logging setup ----
 logging.basicConfig(
@@ -30,33 +40,599 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---- DynamoDB resource ----
-from db_config import dynamodb, table_name
-
-# ---- Validation ----
-from validation.task_validator import validate_task
-
 # ---- Load system prompt template ----
 PROMPT_DIR = Path(__file__).parent / "prompts"
 SYSTEM_PROMPT_TEMPLATE = (PROMPT_DIR / "npc_system_prompt.txt").read_text(encoding="utf-8")
 
 # ---- Bedrock model configuration ----
 BEDROCK_MODEL_ID = os.environ.get(
-    "BEDROCK_MODEL_ID", "us.anthropic.claude-4-5-haiku-20251001-v1:0"
+    "BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 )
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "us-west-2")
 
-# ---- Bedrock client (reuse across requests) ----
-_bedrock_client = None
+# ---- Module-level BedrockModel (connection warmup + prompt caching) ----
+_is_anthropic = "anthropic" in BEDROCK_MODEL_ID
+_model_kwargs = dict(
+    model_id=BEDROCK_MODEL_ID,
+    region_name=BEDROCK_REGION,
+    max_tokens=1024,
+    temperature=0.7,
+)
+if _is_anthropic:
+    _model_kwargs["cache_prompt"] = "default"
+    _model_kwargs["cache_tools"] = "default"
+_bedrock_model = BedrockModel(**_model_kwargs)
+logger.info("BedrockModel pre-warmed: model=%s, region=%s, prompt_caching=%s",
+            BEDROCK_MODEL_ID, BEDROCK_REGION, _is_anthropic)
 
-def get_bedrock_client():
-    global _bedrock_client
-    if _bedrock_client is None:
-        _bedrock_client = boto3.client(
-            "bedrock-runtime",
-            region_name=BEDROCK_REGION,
+# ---- All tools available to the agent ----
+AGENT_TOOLS = [
+    create_task,
+]
+
+
+def create_npc_agent(system_prompt: str, session_manager=None) -> Agent:
+    """Create a Strands Agent instance with pre-warmed Bedrock model and game tools.
+
+    Args:
+        system_prompt: NPC system prompt with persona and rules.
+        session_manager: Optional AgentCoreMemorySessionManager for stateful dialogue.
+    """
+    kwargs = dict(
+        model=_bedrock_model,
+        tools=AGENT_TOOLS,
+        system_prompt=system_prompt,
+        callback_handler=null_callback_handler,
+    )
+    if session_manager is not None:
+        kwargs["session_manager"] = session_manager
+
+    agent = Agent(**kwargs)
+    return agent
+
+
+def _prefetch_game_data(player_id: str, npc_id: str) -> dict:
+    """Pre-fetch all game data in parallel using ThreadPoolExecutor.
+
+    Queries DynamoDB for player info, events, tasks, monsters, and items
+    concurrently, then optionally queries Knowledge Base for monsters/items.
+
+    Returns:
+        dict with keys: player_info, events, tasks, monsters, items, debug_log
+    """
+    debug_log = []
+
+    def _query_player_info():
+        table = dynamodb.Table(table_name("Players"))
+        resp = table.get_item(Key={"player_id": player_id})
+        return resp.get("Item", {})
+
+    def _query_player_events():
+        table = dynamodb.Table(table_name("PlayerEventSummary"))
+        resp = table.query(
+            KeyConditionExpression="player_id = :pid",
+            ExpressionAttributeValues={":pid": player_id},
+            ScanIndexForward=False,
+            Limit=10,
         )
-    return _bedrock_client
+        return resp.get("Items", [])
+
+    def _query_player_tasks():
+        table = dynamodb.Table(table_name("Tasks"))
+        resp = table.query(
+            IndexName="player_id-index",
+            KeyConditionExpression="player_id = :pid",
+            ExpressionAttributeValues={":pid": player_id},
+        )
+        items = resp.get("Items", [])
+        while "LastEvaluatedKey" in resp:
+            resp = table.query(
+                IndexName="player_id-index",
+                KeyConditionExpression="player_id = :pid",
+                ExpressionAttributeValues={":pid": player_id},
+                ExclusiveStartKey=resp["LastEvaluatedKey"],
+            )
+            items.extend(resp.get("Items", []))
+        return items
+
+    def _query_monsters():
+        table = dynamodb.Table(table_name("Monsters"))
+        resp = table.scan()
+        items = resp.get("Items", [])
+        while "LastEvaluatedKey" in resp:
+            resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"])
+            items.extend(resp.get("Items", []))
+        return items
+
+    def _query_items():
+        table = dynamodb.Table(table_name("Items"))
+        resp = table.scan()
+        items = resp.get("Items", [])
+        while "LastEvaluatedKey" in resp:
+            resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"])
+            items.extend(resp.get("Items", []))
+        return items
+
+    # Run all 5 queries in parallel
+    results = {}
+    task_map = {
+        "player_info": _query_player_info,
+        "events": _query_player_events,
+        "tasks": _query_player_tasks,
+        "monsters": _query_monsters,
+        "items": _query_items,
+    }
+
+    prefetch_start = time.time()
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(fn): key for key, fn in task_map.items()}
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                results[key] = future.result()
+            except Exception as e:
+                logger.error(f"Prefetch failed for {key}: {e}")
+                results[key] = [] if key != "player_info" else {}
+
+    prefetch_ms = round((time.time() - prefetch_start) * 1000)
+    debug_log.append({
+        "type": "data_prefetch",
+        "source": "DynamoDB",
+        "queries": list(task_map.keys()),
+        "ms": prefetch_ms,
+    })
+
+    # Optionally query Knowledge Base for monsters and items
+    if BEDROCK_KB_ID:
+        kb_start = time.time()
+        kb_monsters = query_knowledge_base("所有怪物 monsters 全量列表 monster_id 等级 属性")
+        kb_items = query_knowledge_base("所有道具 items 全量列表 item_id 类型 效果")
+        kb_ms = round((time.time() - kb_start) * 1000)
+
+        if kb_monsters:
+            results["monsters"] = "\n\n".join(kb_monsters)
+        if kb_items:
+            results["items"] = "\n\n".join(kb_items)
+
+        debug_log.append({
+            "type": "data_prefetch",
+            "source": "KB",
+            "kb_id": BEDROCK_KB_ID,
+            "monsters_from_kb": bool(kb_monsters),
+            "items_from_kb": bool(kb_items),
+            "ms": kb_ms,
+        })
+
+    results["debug_log"] = debug_log
+    return results
+
+
+def _serialize_for_prompt(data) -> str:
+    """Serialize data to JSON string, converting DynamoDB Decimal types."""
+    return json.dumps(_convert_decimals(data), ensure_ascii=False)
+
+
+def _strip_monster_fields(monsters: list) -> list:
+    """Strip non-essential fields from monster data to reduce token count."""
+    keep = {"monster_id", "name", "level", "hp", "attack", "defense", "drop_items"}
+    stripped = []
+    for m in monsters:
+        entry = {k: v for k, v in m.items() if k in keep}
+        if "drop_items" in entry:
+            entry["drop_items"] = [{"item_id": d["item_id"]} for d in entry["drop_items"]]
+        stripped.append(entry)
+    return stripped
+
+
+def _strip_item_fields(items: list) -> list:
+    """Strip non-essential fields from item data to reduce token count."""
+    keep = {"item_id", "name", "type", "effect"}
+    return [{k: v for k, v in item.items() if k in keep} for item in items]
+
+
+def handle_npc_dialogue_core(player_id: str, npc_id: str) -> dict:
+    """
+    处理 NPC 对话请求。
+
+    流程：
+    1. 验证 NPC 存在
+    2. 预取所有玩家和游戏字典数据（并行查询）
+    3. 构建 system prompt（NPC 人设 + 任务规则）
+    4. 将所有数据注入 user message
+    5. 调用 Strands Agent（提供 create_task 工具 + Memory）
+    6. 从 Agent 响应中提取对话和任务信息
+    """
+    total_start = time.time()
+    logger.info(f"Handling NPC dialogue: player_id={player_id}, npc_id={npc_id}")
+
+    # 1. 校验 NPC（从内存字典或 DynamoDB）
+    npc_table = dynamodb.Table(table_name("NPCs"))
+    try:
+        resp = npc_table.get_item(Key={"npc_id": npc_id})
+    except Exception as e:
+        raise ValueError(f"无法查询 NPC 字典表: {e}")
+
+    if "Item" not in resp:
+        raise ValueError(f"npc_id '{npc_id}' 不存在于 NPC 字典表中")
+
+    npc_info = resp["Item"]
+    logger.info(f"NPC found: {npc_info['name']} ({npc_id})")
+
+    # 2. 预取所有游戏数据（并行）
+    game_data = _prefetch_game_data(player_id, npc_id)
+    debug_log = game_data["debug_log"]
+
+    # 3. 构建 system prompt
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        npc_name=npc_info["name"],
+        npc_role=npc_info["role"],
+        npc_personality=npc_info["personality"],
+    )
+
+    # 4. 构建 user message（注入所有预取数据）
+    player_info_json = _serialize_for_prompt(game_data["player_info"])
+    events_json = _serialize_for_prompt(game_data["events"])
+    tasks_json = _serialize_for_prompt(game_data["tasks"])
+    monsters_json = (
+        game_data["monsters"]
+        if isinstance(game_data["monsters"], str)
+        else _serialize_for_prompt(_strip_monster_fields(game_data["monsters"]))
+    )
+    items_json = (
+        game_data["items"]
+        if isinstance(game_data["items"], str)
+        else _serialize_for_prompt(_strip_item_fields(game_data["items"]))
+    )
+
+    user_message = (
+        f"玩家 {player_id} 来找 NPC {npc_info['name']}（npc_id={npc_id}）对话。\n\n"
+        f"## 玩家信息\n{player_info_json}\n\n"
+        f"## 玩家最近行为日志（最近10条）\n{events_json}\n\n"
+        f"## 玩家已有任务\n{tasks_json}\n\n"
+        f"## 怪物字典\n{monsters_json}\n\n"
+        f"## 道具字典\n{items_json}\n\n"
+        f"请根据以上数据分析玩家处境，调用 create_task 创建任务，然后给出NPC对话。\n"
+        f"注意：NPC的寒暄语已经单独生成，你的对话不要重复寒暄或提及玩家最近的事件，直接以NPC口吻引出任务即可。"
+    )
+
+    # 5. 创建 Memory Session Manager（有状态对话）
+    session_mgr = create_session_manager(player_id, npc_id)
+    has_memory = session_mgr is not None
+
+    debug_log.append({
+        "type": "memory",
+        "action": "session_init",
+        "enabled": has_memory,
+        "actor_id": player_id,
+        "session_id": f"{player_id}_{npc_id}" if has_memory else None,
+    })
+
+    # 6. Log LLM configuration
+    debug_log.append({
+        "type": "llm",
+        "action": "invoke",
+        "model_id": BEDROCK_MODEL_ID,
+        "region": BEDROCK_REGION,
+        "prompt_caching": _is_anthropic,
+        "npc": npc_info["name"],
+    })
+
+    # 7. 调用 Strands Agent
+    reset_call_log()
+    agent_start = time.time()
+    agent = None
+    try:
+        if session_mgr is not None:
+            with session_mgr as sm:
+                agent = create_npc_agent(system_prompt, session_manager=sm)
+                result = agent(user_message)
+        else:
+            agent = create_npc_agent(system_prompt)
+            result = agent(user_message)
+
+        agent_ms = round((time.time() - agent_start) * 1000)
+        logger.info(f"Agent completed in {agent_ms}ms (memory={has_memory})")
+
+        # Extract the agent's final text response
+        dialogue_text = str(result)
+
+        # Extract tool call info from agent messages for debug_log
+        for msg in agent.messages:
+            if msg.get("role") == "assistant":
+                for content_block in msg.get("content", []):
+                    if "toolUse" in content_block:
+                        tool_use = content_block["toolUse"]
+                        debug_log.append({
+                            "type": "tool_call",
+                            "name": tool_use.get("name", ""),
+                            "input": tool_use.get("input", {}),
+                        })
+            if msg.get("role") == "user":
+                for content_block in msg.get("content", []):
+                    if "toolResult" in content_block:
+                        tool_result = content_block["toolResult"]
+                        result_text = ""
+                        for r_content in tool_result.get("content", []):
+                            if "text" in r_content:
+                                result_text = r_content["text"][:200]
+                                break
+                        debug_log.append({
+                            "type": "tool_result",
+                            "toolUseId": tool_result.get("toolUseId", ""),
+                            "result": result_text,
+                        })
+
+    except Exception as e:
+        agent_ms = round((time.time() - agent_start) * 1000)
+        logger.error(f"Agent call failed after {agent_ms}ms: {e}", exc_info=True)
+        debug_log.append({
+            "type": "error",
+            "message": str(e),
+            "ms": agent_ms,
+        })
+        dialogue_text = (
+            f"（{npc_info['name']}看起来在思考什么）"
+            f"抱歉，我现在有些走神……你稍后再来找我吧。"
+        )
+
+    # Append KB call logs collected during tool execution
+    for kb_entry in get_call_log():
+        debug_log.append(kb_entry)
+
+    # 8. 从 Agent messages 中提取已创建的 task
+    task_obj = _extract_created_task(agent.messages if agent else [])
+
+    total_ms = round((time.time() - total_start) * 1000)
+    logger.info(f"NPC dialogue completed: npc={npc_info['name']}, total={total_ms}ms (agent={agent_ms}ms, memory={has_memory})")
+
+    debug_log.append({
+        "type": "timing",
+        "label": "总耗时",
+        "total_ms": total_ms,
+        "details": {"agent": agent_ms, "memory_enabled": has_memory},
+    })
+
+    return {
+        "dialogue": dialogue_text,
+        "npc_id": npc_id,
+        "npc_name": npc_info["name"],
+        "player_id": player_id,
+        "task": task_obj,
+        "debug_log": debug_log,
+    }
+
+
+def _extract_created_task(messages: list) -> dict | None:
+    """Extract the created task from agent tool call results."""
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        for content_block in msg.get("content", []):
+            if "toolResult" not in content_block:
+                continue
+            tool_result = content_block["toolResult"]
+            for r_content in tool_result.get("content", []):
+                if "text" not in r_content:
+                    continue
+                try:
+                    data = json.loads(r_content["text"])
+                    if isinstance(data, dict) and data.get("success") and data.get("task_id"):
+                        # This is a create_task success result, query the full task
+                        table = dynamodb.Table(table_name("Tasks"))
+                        resp = table.get_item(Key={"task_id": data["task_id"]})
+                        task_item = resp.get("Item")
+                        if task_item:
+                            return _convert_decimals(task_item)
+                except (json.JSONDecodeError, KeyError):
+                    continue
+    return None
+
+
+def handle_pre_generate(player_id: str, event_type: str, event_details: dict) -> dict:
+    """
+    事件驱动的预生成：在玩家产生行为事件时异步调用，
+    提前生成任务和对话，缓存到 game-server 等玩家对话时即时下发。
+
+    流程：
+    1. 根据事件类型选择最匹配的 NPC
+    2. 预取游戏数据
+    3. 构建 event-aware prompt
+    4. 调用 Strands Agent（含 Memory + create_task 工具）
+    """
+    total_start = time.time()
+    logger.info(f"Pre-generate: player={player_id}, event={event_type}, details={event_details}")
+
+    # 1. 根据事件类型选择 NPC
+    npc_id = _select_npc_for_event(event_type, event_details)
+    logger.info(f"Pre-generate: selected npc={npc_id} for event={event_type}")
+
+    # 2. 校验 NPC
+    npc_table = dynamodb.Table(table_name("NPCs"))
+    try:
+        resp = npc_table.get_item(Key={"npc_id": npc_id})
+    except Exception as e:
+        logger.error(f"Pre-generate: NPC query failed: {e}")
+        return {"dialogue": None, "npc_id": npc_id, "task": None, "debug_log": []}
+
+    if "Item" not in resp:
+        logger.error(f"Pre-generate: NPC {npc_id} not found")
+        return {"dialogue": None, "npc_id": npc_id, "task": None, "debug_log": []}
+
+    npc_info = resp["Item"]
+
+    # 3. 预取数据
+    game_data = _prefetch_game_data(player_id, npc_id)
+    debug_log = game_data["debug_log"]
+
+    # 检查是否已有该 NPC 的 pending/in_progress 任务
+    existing_tasks = game_data.get("tasks", [])
+    has_active_task = any(
+        t.get("npc_id") == npc_id and t.get("status") in ("pending", "in_progress")
+        for t in existing_tasks
+    )
+    if has_active_task:
+        logger.info(f"Pre-generate: player already has active task from {npc_id}, skipping")
+        return {"dialogue": None, "npc_id": npc_id, "task": None, "debug_log": debug_log}
+
+    # 4. 构建 system prompt
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        npc_name=npc_info["name"],
+        npc_role=npc_info["role"],
+        npc_personality=npc_info["personality"],
+    )
+
+    # 5. 构建 event-aware user message
+    player_info_json = _serialize_for_prompt(game_data["player_info"])
+    events_json = _serialize_for_prompt(game_data["events"])
+    tasks_json = _serialize_for_prompt(game_data["tasks"])
+    monsters_json = (
+        game_data["monsters"]
+        if isinstance(game_data["monsters"], str)
+        else _serialize_for_prompt(_strip_monster_fields(game_data["monsters"]))
+    )
+    items_json = (
+        game_data["items"]
+        if isinstance(game_data["items"], str)
+        else _serialize_for_prompt(_strip_item_fields(game_data["items"]))
+    )
+
+    event_desc = _describe_event(event_type, event_details)
+    user_message = (
+        f"玩家 {player_id} 刚刚发生了事件：{event_desc}\n"
+        f"请为 NPC {npc_info['name']}（npc_id={npc_id}）预先准备好对话和任务。\n\n"
+        f"## 玩家信息\n{player_info_json}\n\n"
+        f"## 玩家最近行为日志（最近10条）\n{events_json}\n\n"
+        f"## 玩家已有任务\n{tasks_json}\n\n"
+        f"## 怪物字典\n{monsters_json}\n\n"
+        f"## 道具字典\n{items_json}\n\n"
+        f"要求：\n"
+        f"1. 注意：NPC的寒暄语已经单独生成并提到了玩家的事件，所以你的对话不要重复提及「{event_desc}」这件事\n"
+        f"2. 直接以NPC的口吻引出任务，简短自然地过渡到任务内容\n"
+        f"3. 调用 create_task 创建一个适合玩家当前等级的任务\n"
+    )
+
+    # 6. 创建 Memory Session Manager
+    session_mgr = create_session_manager(player_id, npc_id)
+    has_memory = session_mgr is not None
+
+    debug_log.append({
+        "type": "memory",
+        "action": "session_init",
+        "enabled": has_memory,
+        "actor_id": player_id,
+        "session_id": f"{player_id}_{npc_id}" if has_memory else None,
+    })
+
+    debug_log.append({
+        "type": "llm",
+        "action": "invoke",
+        "model_id": BEDROCK_MODEL_ID,
+        "region": BEDROCK_REGION,
+        "prompt_caching": _is_anthropic,
+        "npc": npc_info["name"],
+        "mode": "pre_generate",
+    })
+
+    # 7. 调用 Strands Agent
+    reset_call_log()
+    agent_start = time.time()
+    agent = None
+    try:
+        if session_mgr is not None:
+            with session_mgr as sm:
+                agent = create_npc_agent(system_prompt, session_manager=sm)
+                result = agent(user_message)
+        else:
+            agent = create_npc_agent(system_prompt)
+            result = agent(user_message)
+
+        agent_ms = round((time.time() - agent_start) * 1000)
+        logger.info(f"Pre-generate agent completed in {agent_ms}ms")
+        dialogue_text = str(result)
+
+        for msg in agent.messages:
+            if msg.get("role") == "assistant":
+                for content_block in msg.get("content", []):
+                    if "toolUse" in content_block:
+                        tool_use = content_block["toolUse"]
+                        debug_log.append({
+                            "type": "tool_call",
+                            "name": tool_use.get("name", ""),
+                            "input": tool_use.get("input", {}),
+                        })
+            if msg.get("role") == "user":
+                for content_block in msg.get("content", []):
+                    if "toolResult" in content_block:
+                        tool_result = content_block["toolResult"]
+                        result_text = ""
+                        for r_content in tool_result.get("content", []):
+                            if "text" in r_content:
+                                result_text = r_content["text"][:200]
+                                break
+                        debug_log.append({
+                            "type": "tool_result",
+                            "toolUseId": tool_result.get("toolUseId", ""),
+                            "result": result_text,
+                        })
+
+    except Exception as e:
+        agent_ms = round((time.time() - agent_start) * 1000)
+        logger.error(f"Pre-generate agent failed after {agent_ms}ms: {e}", exc_info=True)
+        debug_log.append({"type": "error", "message": str(e), "ms": agent_ms})
+        dialogue_text = None
+
+    for kb_entry in get_call_log():
+        debug_log.append(kb_entry)
+
+    task_obj = _extract_created_task(agent.messages if agent else [])
+
+    total_ms = round((time.time() - total_start) * 1000)
+    logger.info(f"Pre-generate completed: npc={npc_info['name']}, total={total_ms}ms")
+
+    debug_log.append({
+        "type": "timing",
+        "label": "预生成总耗时",
+        "total_ms": total_ms,
+        "details": {"agent": agent_ms, "memory_enabled": has_memory, "event_type": event_type},
+    })
+
+    return {
+        "dialogue": dialogue_text,
+        "npc_id": npc_id,
+        "npc_name": npc_info["name"],
+        "player_id": player_id,
+        "task": task_obj,
+        "debug_log": debug_log,
+    }
+
+
+def _select_npc_for_event(event_type: str, event_details: dict) -> str:
+    """根据事件类型选择最匹配的 NPC。"""
+    # Mapping: event_type -> best NPC
+    mapping = {
+        "player_login": "npc_elder",        # 长老负责新手引导
+        "battle_victory": "npc_elder",      # 长老给战斗后续任务
+        "battle_defeat": "npc_healer",      # 药师在战败后关心玩家
+        "task_completed": "npc_elder",      # 长老给下一个任务
+        "item_used": "npc_healer",          # 药师关注药水使用
+        "item_acquired": "npc_merchant",    # 商人关注道具获取
+        "level_up": "npc_elder",            # 长老庆祝升级
+    }
+    return mapping.get(event_type, "npc_elder")
+
+
+def _describe_event(event_type: str, event_details: dict) -> str:
+    """将事件类型和详情转换为中文描述。"""
+    descriptions = {
+        "player_login": "新玩家登录" if event_details.get("is_new") else "玩家回归登录",
+        "battle_victory": f"战斗胜利，击败了 {event_details.get('monster_name', '怪物')}",
+        "battle_defeat": f"战斗失败，败给了 {event_details.get('monster_name', '怪物')}",
+        "task_completed": f"完成了任务「{event_details.get('title', '未知任务')}」",
+        "item_used": f"使用了道具 {event_details.get('item_id', '未知道具')}",
+        "item_acquired": f"获得了道具 {event_details.get('item_id', '未知道具')}",
+        "level_up": f"升级到 Lv.{event_details.get('new_level', '?')}",
+    }
+    return descriptions.get(event_type, f"发生了事件 {event_type}")
 
 
 def _convert_decimals(obj):
@@ -70,383 +646,148 @@ def _convert_decimals(obj):
     return obj
 
 
-def _scan_table(base_name: str) -> list:
-    """Scan a full DynamoDB table, handling pagination."""
-    table = dynamodb.Table(table_name(base_name))
-    resp = table.scan()
-    items = resp.get("Items", [])
-    while "LastEvaluatedKey" in resp:
-        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"])
-        items.extend(resp.get("Items", []))
-    return items
+# ---- NPC-Specific Greeting Templates (rule-based, no LLM needed) ----
+
+_NPC_GREETINGS = {
+    "npc_elder": {
+        "battle_victory": "年轻人，听说你击败了{target}，老夫甚感欣慰。",
+        "battle_defeat": "别灰心，{target}确实不好对付，老夫年轻时也吃过不少亏。",
+        "task_completed": "干得好，你的成长老夫都看在眼里。",
+        "item_acquired": "哦？你得到了{target}，不错不错。",
+        "item_used": "善用物资是冒险者的基本素养，做得好。",
+        "level_up": "恭喜你变得更强了！老夫看到了你身上的潜力。",
+        "talk_to_npc": "又来了？好，坐下说吧。",
+        "_default": "年轻的冒险者，欢迎来到勇者大陆。老夫这里总有些事情需要帮忙。",
+    },
+    "npc_blacksmith": {
+        "battle_victory": "嘿！打赢了{target}？不赖嘛，武器没卷刃吧？",
+        "battle_defeat": "输给{target}了？哼，肯定是装备不行，来我这看看。",
+        "task_completed": "活儿干得漂亮！够爽快！",
+        "item_acquired": "哦，弄到{target}了？拿来让我瞧瞧成色。",
+        "item_used": "东西就是拿来用的，别舍不得！",
+        "level_up": "块头又大了？那得配把更趁手的家伙！",
+        "talk_to_npc": "来啦？炉子正热着呢，有啥事快说。",
+        "_default": "锤子和铁砧就是我的语言，有什么需要尽管开口。",
+    },
+    "npc_merchant": {
+        "battle_victory": "听说你赢了{target}？战利品打算怎么处理呀？",
+        "battle_defeat": "哎呀，{target}那么厉害？要不要看看我这有什么好东西？",
+        "task_completed": "任务完成啦？奖励到手的感觉不错吧～",
+        "item_acquired": "嗯？{target}？识货嘛，这东西可值不少。",
+        "item_used": "用掉了？没关系，我这里货源充足～",
+        "level_up": "升级了呀！更强了就能赚更多，嘻嘻。",
+        "talk_to_npc": "欢迎光临～今天想看点什么？",
+        "_default": "旅途中总需要些好东西傍身，来看看吧～",
+    },
+    "npc_healer": {
+        "battle_victory": "你击败了{target}？有没有受伤？让我看看。",
+        "battle_defeat": "天哪，你受伤了！快过来，我帮你处理一下。",
+        "task_completed": "辛苦了，记得照顾好自己的身体哦。",
+        "item_acquired": "你拿到了{target}？如果是药材的话我可以帮你鉴定。",
+        "item_used": "嗯，按时用药是好习惯，身体是冒险的本钱。",
+        "level_up": "变强了呢！不过越强越要注意休息哦。",
+        "talk_to_npc": "你来了，最近身体还好吗？",
+        "_default": "冒险者你好，需要治疗或者药水吗？",
+    },
+}
+
+# Cache for name resolution (populated on first use)
+_name_cache = {}
 
 
-def _query_by_player(base_name: str, player_id: str, index: str = None, limit: int = None) -> list:
-    """Query a DynamoDB table by player_id."""
-    table = dynamodb.Table(table_name(base_name))
-    kwargs = {
-        "KeyConditionExpression": "player_id = :pid",
-        "ExpressionAttributeValues": {":pid": player_id},
+def _resolve_target_name(event_type: str, target_id: str) -> str:
+    """Resolve a target_id to its Chinese display name using DynamoDB dictionaries."""
+    if not target_id:
+        return ""
+    if target_id in _name_cache:
+        return _name_cache[target_id]
+
+    # Determine which table to query based on event type
+    table_map = {
+        "battle_victory": ("Monsters", "monster_id"),
+        "battle_defeat": ("Monsters", "monster_id"),
+        "kill_monster": ("Monsters", "monster_id"),
+        "item_acquired": ("Items", "item_id"),
+        "item_used": ("Items", "item_id"),
+        "collect_item": ("Items", "item_id"),
+        "use_item": ("Items", "item_id"),
+        "talk_to_npc": ("NPCs", "npc_id"),
+        "task_accepted": ("Tasks", "task_id"),
+        "task_completed": ("Tasks", "task_id"),
     }
-    if index:
-        kwargs["IndexName"] = index
-    if limit:
-        kwargs["Limit"] = limit
-        kwargs["ScanIndexForward"] = False
-    resp = table.query(**kwargs)
-    items = resp.get("Items", [])
-    if not limit:
-        while "LastEvaluatedKey" in resp:
-            kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
-            resp = table.query(**kwargs)
-            items.extend(resp.get("Items", []))
-    return items
+    mapping = table_map.get(event_type)
+    if not mapping:
+        return target_id
 
-
-def prefetch_all_data(player_id: str) -> dict:
-    """Pre-fetch all data needed by the LLM in one batch."""
-    timings = {}
-
-    t0 = time.time()
+    tbl_name, key_attr = mapping
     try:
-        table = dynamodb.Table(table_name("Players"))
-        resp = table.get_item(Key={"player_id": player_id})
-        player_info = resp.get("Item", {})
-    except Exception as e:
-        logger.error(f"Failed to get player info: {e}")
-        player_info = {}
-    timings["player_info"] = round((time.time() - t0) * 1000)
-
-    t0 = time.time()
-    try:
-        player_events = _query_by_player("PlayerEventSummary", player_id, limit=20)
-    except Exception as e:
-        logger.error(f"Failed to get player events: {e}")
-        player_events = []
-    timings["player_events"] = round((time.time() - t0) * 1000)
-
-    t0 = time.time()
-    try:
-        monsters = _scan_table("Monsters")
-    except Exception as e:
-        logger.error(f"Failed to get monsters: {e}")
-        monsters = []
-    timings["monsters"] = round((time.time() - t0) * 1000)
-
-    t0 = time.time()
-    try:
-        items = _scan_table("Items")
-    except Exception as e:
-        logger.error(f"Failed to get items: {e}")
-        items = []
-    timings["items"] = round((time.time() - t0) * 1000)
-
-    t0 = time.time()
-    try:
-        npcs = _scan_table("NPCs")
-    except Exception as e:
-        logger.error(f"Failed to get npcs: {e}")
-        npcs = []
-    timings["npcs"] = round((time.time() - t0) * 1000)
-
-    t0 = time.time()
-    try:
-        player_tasks = _query_by_player("Tasks", player_id, index="player_id-index")
-    except Exception as e:
-        logger.error(f"Failed to get player tasks: {e}")
-        player_tasks = []
-    timings["player_tasks"] = round((time.time() - t0) * 1000)
-
-    return {
-        "player_info": _convert_decimals(player_info),
-        "player_events": _convert_decimals(player_events),
-        "monsters": _convert_decimals(monsters),
-        "items": _convert_decimals(items),
-        "npcs": _convert_decimals(npcs),
-        "player_tasks": _convert_decimals(player_tasks),
-        "timings": timings,
-    }
+        tbl = dynamodb.Table(table_name(tbl_name))
+        resp = tbl.get_item(Key={key_attr: target_id})
+        item = resp.get("Item", {})
+        name = item.get("name") or item.get("title") or target_id
+        _name_cache[target_id] = name
+        return name
+    except Exception:
+        return target_id
 
 
-def call_bedrock_direct(system_prompt: str, user_message: str) -> str:
+def generate_greeting(player_id: str, npc_id: str) -> dict:
+    """根据玩家最近行为生成 NPC 寒暄语（纯规则模板，无需 LLM，极快）。
+
+    Returns:
+        {"greeting": str, "npc_id": str, "npc_name": str, "player_id": str}
     """
-    Call Bedrock Converse API directly (no tool use) for single-round-trip response.
-    """
-    client = get_bedrock_client()
-    response = client.converse(
-        modelId=BEDROCK_MODEL_ID,
-        system=[{"text": system_prompt}],
-        messages=[
-            {"role": "user", "content": [{"text": user_message}]},
-        ],
-        inferenceConfig={
-            "maxTokens": 1024,
-            "temperature": 0.7,
-        },
-    )
-    # Extract text from response
-    output = response.get("output", {})
-    message = output.get("message", {})
-    content = message.get("content", [])
-    text_parts = [block["text"] for block in content if "text" in block]
-    return "\n".join(text_parts)
+    start = time.time()
 
-
-def parse_llm_json(text: str) -> dict:
-    """Extract JSON from LLM response (handles markdown code blocks)."""
-    # Try to extract from ```json ... ``` block
-    match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
-    if match:
-        text = match.group(1)
-    # Try direct JSON parse
-    text = text.strip()
-    return json.loads(text)
-
-
-def create_task_from_json(player_id: str, npc_id: str, task_json: dict, player_level: int = None) -> dict:
-    """Validate and write task to DynamoDB from LLM JSON output."""
-    import uuid
-    from datetime import datetime, timezone
-
-    task_data = {
-        "player_id": player_id,
-        "npc_id": npc_id,
-        "title": task_json.get("title", ""),
-        "description": task_json.get("description", ""),
-        "conditions": task_json.get("conditions", []),
-        "awards": task_json.get("awards", []),
-    }
-
-    # Validate
-    validation = validate_task(task_data, player_level=player_level)
-    if not validation["valid"]:
-        logger.warning(f"Task validation failed: {validation['reason']}")
-        return {"success": False, "reason": validation["reason"]}
-
-    # Generate task ID and write
-    task_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-
-    task_item = {
-        "task_id": task_id,
-        "player_id": player_id,
-        "npc_id": npc_id,
-        "title": task_data["title"],
-        "description": task_data["description"],
-        "status": "pending",
-        "conditions": task_data["conditions"],
-        "awards": task_data["awards"],
-        "created_at": now,
-        "completed_at": None,
-    }
-
-    for condition in task_item["conditions"]:
-        if "current_count" not in condition:
-            condition["current_count"] = 0
-
-    try:
-        table = dynamodb.Table(table_name("Tasks"))
-        table.put_item(Item=task_item)
-        logger.info(f"Task created: task_id={task_id}, title={task_data['title']}")
-        return {"success": True, "task": task_item}
-    except Exception as e:
-        logger.error(f"Failed to write task: {e}")
-        return {"success": False, "reason": [str(e)]}
-
-
-def handle_npc_dialogue_core(player_id: str, npc_id: str) -> dict:
-    """
-    处理 NPC 对话请求。
-
-    优化流程（单次 LLM 调用）：
-    1. 验证 NPC 存在
-    2. 检查未完成任务
-    3. 预获取所有数据
-    4. 单次 LLM 调用获取 JSON（含任务+对话）
-    5. 解析 JSON，校验并写入任务
-    """
-    total_start = time.time()
-    llm_ms = 0
-    logger.info(f"Handling NPC dialogue: player_id={player_id}, npc_id={npc_id}")
-
-    # 1. 校验 NPC
+    # 1. 查询 NPC 信息
     npc_table = dynamodb.Table(table_name("NPCs"))
     try:
         resp = npc_table.get_item(Key={"npc_id": npc_id})
-    except Exception as e:
-        raise ValueError(f"无法查询 NPC 字典表: {e}")
+        npc_info = resp.get("Item", {})
+    except Exception:
+        npc_info = {}
+    npc_name = npc_info.get("name", npc_id)
 
-    if "Item" not in resp:
-        raise ValueError(f"npc_id '{npc_id}' 不存在于 NPC 字典表中")
-
-    npc_info = resp["Item"]
-    logger.info(f"NPC found: {npc_info['name']} ({npc_id})")
-
-    # 2. 预获取所有数据
-    prefetch_start = time.time()
-    data = prefetch_all_data(player_id)
-    prefetch_ms = round((time.time() - prefetch_start) * 1000)
-    logger.info(f"Prefetch: {prefetch_ms}ms {data['timings']}")
-
-    # 4. 构建精简消息
-    p = data["player_info"]
-    hp = int(p.get("hp", 0))
-    max_hp = int(p.get("max_hp", 1))
-    hp_pct = round(hp / max_hp * 100)
-
-    player_summary = f"Lv{p.get('level',1)} HP:{hp}/{max_hp}({hp_pct}%) ATK:{p.get('attack',0)} DEF:{p.get('defense',0)} Gold:{p.get('gold',0)}"
-    inv = p.get("inventory", [])
-    inv_str = ", ".join(f"{i['item_id']}x{i['quantity']}" for i in inv) if inv else "空"
-
-    player_level = int(p.get("level", 1))
-    monsters_slim = [{"id": m["monster_id"], "name": m.get("name",""), "lv": int(m.get("level",1))} for m in data["monsters"]]
-    monsters_slim.sort(key=lambda x: x["lv"])
-    # Filter to only show player-level monster for kill tasks
-    level_matched_monsters = [m for m in monsters_slim if m["lv"] == player_level]
-
-    items_slim = [{"id": i["item_id"], "name": i.get("name",""), "type": i.get("type","")} for i in data["items"]]
-    npcs_slim = [{"id": n["npc_id"], "name": n.get("name","")} for n in data["npcs"]]
-
-    events_str = "无"
-    if data["player_events"]:
-        ev_lines = [f"{ev.get('event_type','')}:{ev.get('target_id','')}={ev.get('result','')}" for ev in data["player_events"][:10]]
-        events_str = "; ".join(ev_lines)
-
-    completed_tasks_str = "无"
-    active_tasks_str = "无"
-    if data["player_tasks"]:
-        completed_lines = []
-        active_lines = []
-        for t in data["player_tasks"]:
-            conds = ",".join(f"{c['type']}:{c['target_id']}" for c in t.get("conditions",[]))
-            entry = f"{t.get('title','未知')}({conds})"
-            if t.get("status") == "completed":
-                completed_lines.append(entry)
-            else:
-                active_lines.append(f"{t.get('status','')}|{entry}")
-        if completed_lines:
-            completed_tasks_str = "; ".join(completed_lines)
-        if active_lines:
-            active_tasks_str = "; ".join(active_lines)
-
-    user_message = f"""玩家 {player_id} 来找你对话。
-
-玩家: {player_summary}
-背包: {inv_str}
-最近事件: {events_str}
-已完成任务: {completed_tasks_str}
-进行中任务: {active_tasks_str}
-可击杀怪物(仅限玩家同等级): {json.dumps(level_matched_monsters, ensure_ascii=False)}
-道具: {json.dumps(items_slim, ensure_ascii=False)}
-NPC: {json.dumps(npcs_slim, ensure_ascii=False)}"""
-
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        npc_name=npc_info["name"],
-        npc_role=npc_info["role"],
-        npc_personality=npc_info["personality"],
-    )
-
-    # 5. 构建 debug_log
-    debug_log = []
-    debug_log.append({
-        "type": "timing",
-        "label": "数据预获取",
-        "total_ms": prefetch_ms,
-        "details": data["timings"],
-    })
-    for key, label in [
-        ("player_info", "get_player_info"),
-        ("player_events", "get_player_events"),
-        ("monsters", "get_available_monsters"),
-        ("items", "get_available_items"),
-        ("npcs", "get_available_npcs"),
-        ("player_tasks", "get_player_tasks"),
-    ]:
-        debug_log.append({
-            "type": "tool_call",
-            "name": label,
-            "input": {"player_id": player_id} if "player" in key else {},
-        })
-
-    # 6. 单次 LLM 调用
-    llm_start = time.time()
-    dialogue_text = ""
-    task_obj = None
+    # 2. 查询最近一次行为事件
+    npc_templates = _NPC_GREETINGS.get(npc_id, _NPC_GREETINGS["npc_elder"])
+    greeting = npc_templates.get("_default", "你好，冒险者。")
     try:
-        raw_response = call_bedrock_direct(system_prompt, user_message)
-        llm_ms = round((time.time() - llm_start) * 1000)
-        logger.info(f"LLM response: {llm_ms}ms, length={len(raw_response)}")
-
-        debug_log.append({
-            "type": "reasoning",
-            "text": raw_response[:500],
-        })
-
-        # Parse JSON
-        result_json = parse_llm_json(raw_response)
-        dialogue_text = result_json.get("dialogue", "")
-        task_json = result_json.get("task", {})
-
-        if task_json:
-            # Validate and write task
-            debug_log.append({
-                "type": "tool_call",
-                "name": "create_task",
-                "input": task_json,
-            })
-            create_result = create_task_from_json(player_id, npc_id, task_json, player_level=player_level)
-            if create_result["success"]:
-                task_obj = _convert_decimals(create_result["task"])
-                debug_log.append({
-                    "type": "tool_result",
-                    "result": f"success: task_id={task_obj['task_id']}",
-                })
-            else:
-                debug_log.append({
-                    "type": "tool_result",
-                    "result": f"failed: {create_result.get('reason','')}",
-                })
-    except json.JSONDecodeError as e:
-        llm_ms = round((time.time() - llm_start) * 1000)
-        logger.error(f"Failed to parse LLM JSON: {e}")
-        dialogue_text = (
-            f"（{npc_info['name']}看起来在思考什么）"
-            f"抱歉，我现在有些走神……你稍后再来找我吧。"
+        events_table = dynamodb.Table(table_name("PlayerEventSummary"))
+        resp = events_table.query(
+            KeyConditionExpression="player_id = :pid",
+            ExpressionAttributeValues={":pid": player_id},
+            ScanIndexForward=False,
+            Limit=1,
         )
+        events = resp.get("Items", [])
+        if events:
+            event = events[0]
+            event_type = event.get("event_type", "")
+            target_id = event.get("target_id", "")
+            target_name = _resolve_target_name(event_type, target_id)
+            template = npc_templates.get(event_type)
+            if template:
+                greeting = template.format(target=target_name)
     except Exception as e:
-        llm_ms = round((time.time() - llm_start) * 1000)
-        logger.error(f"LLM call failed: {e}")
-        dialogue_text = (
-            f"（{npc_info['name']}看起来在思考什么）"
-            f"抱歉，我现在有些走神……你稍后再来找我吧。"
-        )
+        logger.warning(f"Failed to query events for greeting: {e}")
 
-    total_ms = round((time.time() - total_start) * 1000)
-    logger.info(f"NPC dialogue completed: npc={npc_info['name']}, total={total_ms}ms (prefetch={prefetch_ms}ms, llm={llm_ms}ms)")
-
-    debug_log.append({
-        "type": "timing",
-        "label": "总耗时",
-        "total_ms": total_ms,
-        "details": {"prefetch": prefetch_ms, "llm": llm_ms},
-    })
+    ms = round((time.time() - start) * 1000)
+    logger.info(f"Greeting generated in {ms}ms for player={player_id}, npc={npc_name}")
 
     return {
-        "dialogue": dialogue_text,
+        "greeting": greeting,
         "npc_id": npc_id,
-        "npc_name": npc_info["name"],
+        "npc_name": npc_name,
         "player_id": player_id,
-        "task": task_obj,
-        "debug_log": debug_log,
     }
 
 
-# ---- FastAPI HTTP server ----
+# ---- FastAPI HTTP server (local debug entry point) ----
 
 app = FastAPI(
     title="NPC Agent Service",
-    description="AI-driven NPC dialogue and task generation service for the RPG game demo.",
-    version="1.0.0",
+    description="AI-driven NPC dialogue and task generation service (Strands Agent + Tool Use + Memory).",
+    version="2.0.0",
 )
 
 
@@ -464,6 +805,13 @@ class DialogueResponse(BaseModel):
     debug_log: list = []
 
 
+class GreetingResponse(BaseModel):
+    greeting: str
+    npc_id: str
+    npc_name: str
+    player_id: str
+
+
 @app.post("/agent/dialogue", response_model=DialogueResponse)
 async def dialogue(request: DialogueRequest):
     try:
@@ -476,9 +824,35 @@ async def dialogue(request: DialogueRequest):
         raise HTTPException(status_code=500, detail=f"NPC Agent 服务内部错误: {str(e)}")
 
 
+class PreGenerateRequest(BaseModel):
+    player_id: str
+    event_type: str
+    event_details: dict = {}
+
+
+@app.post("/agent/pre_generate", response_model=DialogueResponse)
+async def pre_generate(request: PreGenerateRequest):
+    try:
+        result = handle_pre_generate(request.player_id, request.event_type, request.event_details)
+        return result
+    except Exception as e:
+        logger.error(f"Pre-generate error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/agent/greeting", response_model=GreetingResponse)
+async def greeting(request: DialogueRequest):
+    try:
+        result = generate_greeting(request.player_id, request.npc_id)
+        return result
+    except Exception as e:
+        logger.error(f"Greeting error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "npc-agent"}
+    return {"status": "healthy", "service": "npc-agent", "mode": "strands-agent-tool-use"}
 
 
 if __name__ == "__main__":

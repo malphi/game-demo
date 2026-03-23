@@ -3,13 +3,17 @@ import { PLAYER_INITIAL, ITEM_DICT } from '../data/GameData.js';
 
 export default class Player extends Phaser.GameObjects.Sprite {
   constructor(scene, x, y) {
-    super(scene, x, y, 'player');
+    // Determine player texture based on ID
+    const playerId = window.gamePlayerId || '1';
+    const textureKey = playerId === '2' ? 'player_2' : 'player';
+
+    super(scene, x, y, textureKey);
     scene.add.existing(this);
     scene.physics.add.existing(this);
 
     // Player stats
-    this.player_id = PLAYER_INITIAL.player_id;
-    this.playerName = PLAYER_INITIAL.name;
+    this.player_id = playerId;
+    this.playerName = playerId === '2' ? '女勇者' : '勇者';
     this.level = PLAYER_INITIAL.level;
     this.exp = PLAYER_INITIAL.exp;
     this.exp_to_next_level = PLAYER_INITIAL.exp_to_next_level;

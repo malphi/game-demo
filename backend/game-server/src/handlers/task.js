@@ -2,6 +2,7 @@ const playerDataService = require('../services/PlayerDataService');
 const taskManager = require('../services/TaskManager');
 const InventoryManager = require('../services/InventoryManager');
 const eventEmitter = require('../services/EventEmitter');
+const taskPreGenerator = require('../services/TaskPreGenerator');
 
 /**
  * Task REST API handlers.
@@ -89,6 +90,12 @@ async function handleCompleteTask(req, res) {
 
     // Save updated player
     await playerDataService.savePlayer(player);
+
+    // Trigger pre-generation for next task
+    taskPreGenerator.triggerPreGeneration(player_id, 'task_completed', {
+      task_id: taskId,
+      title: result.task?.title,
+    });
 
     return res.json({
       success: true,
@@ -198,6 +205,12 @@ async function handleUseItem(ws, message) {
 
   // Save player
   await playerDataService.savePlayer(player);
+
+  // Trigger pre-generation on item use
+  taskPreGenerator.triggerPreGeneration(player_id, 'item_used', {
+    item_id,
+    effect: result.effect,
+  });
 }
 
 module.exports = {

@@ -1,6 +1,7 @@
 const BattleSystem = require('../services/BattleSystem');
 const playerDataService = require('../services/PlayerDataService');
 const taskManager = require('../services/TaskManager');
+const taskPreGenerator = require('../services/TaskPreGenerator');
 
 /**
  * Battle handler for WebSocket messages.
@@ -125,6 +126,13 @@ async function handleBattle(ws, message) {
 
   // Save updated player data
   await playerDataService.savePlayer(player);
+
+  // Trigger async pre-generation for next NPC dialogue
+  taskPreGenerator.triggerPreGeneration(player_id, `battle_${battleResult.result}`, {
+    monster_id,
+    monster_name: battleResult.monster_name,
+    rewards: battleResult.rewards,
+  });
 }
 
 module.exports = { handleBattle };

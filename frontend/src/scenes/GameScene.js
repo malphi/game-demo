@@ -9,6 +9,7 @@ import {
   ITEM_DICT,
 } from '../data/GameData.js';
 import WebSocketClient from '../network/WebSocketClient.js';
+import RemotePlayer from '../entities/RemotePlayer.js';
 
 export default class GameScene extends Phaser.Scene {
   constructor() {
@@ -19,6 +20,8 @@ export default class GameScene extends Phaser.Scene {
     this.battleCooldown = false;
     this.dialogueCooldown = false;
     this.lastDialogueNpcId = null; // Track NPC to prevent re-trigger while still overlapping
+    this.remotePlayers = new Map(); // player_id -> RemotePlayer
+    this.lastPositionSendTime = 0;
   }
 
   create() {
@@ -171,6 +174,14 @@ export default class GameScene extends Phaser.Scene {
         } catch (err) {
           console.warn('[API:ERR] POST /api/game/start', err.message);
         }
+        // Register for multiplayer visibility
+        this.wsClient.send('player_register', {
+          player_id: this.player.player_id,
+          x: this.player.x,
+          y: this.player.y,
+          character: this.player.player_id === '2' ? 'player_2' : 'player',
+          name: this.player.playerName,
+        });
       } else {
         console.error('Failed to connect to server');
       }
@@ -222,6 +233,17 @@ export default class GameScene extends Phaser.Scene {
       this.player.body.setVelocity(0, 0);
     } else {
       this.player.move(this.cursors);
+    }
+
+    // Send local player position to server (throttled to every 100ms)
+    const now = Date.now();
+    if (now - this.lastPositionSendTime > 100 && this.wsClient?.isConnected()) {
+      this.lastPositionSendTime = now;
+      this.wsClient.send('player_move', {
+        player_id: this.player.player_id,
+        x: Math.round(this.player.x),
+        y: Math.round(this.player.y),
+      });
     }
 
     // Update monster name positions
@@ -375,13 +397,24 @@ export default class GameScene extends Phaser.Scene {
   }
 
   setupWSHandlers() {
+    // Greeting arrives fast (~100ms), displayed with typewriter while LLM processes
+    this.wsClient.on('npc_dialogue_greeting', (data) => {
+      const uiScene = this.scene.get('UIScene');
+      if (uiScene) {
+        uiScene.events.emit('show-greeting', {
+          npcName: data.npc_name,
+          greeting: data.greeting,
+        });
+      }
+    });
+
     this.wsClient.on('npc_dialogue_response', (data) => {
       // Write debug log to Agent Console panel
       if (data.debug_log && data.debug_log.length > 0) {
         this.writeAgentConsole(data.npc_name, data.debug_log);
       }
 
-      // Replace the waiting dialogue with the real response
+      // Transition from greeting to full dialogue response
       const uiScene = this.scene.get('UIScene');
       if (uiScene) {
         uiScene.events.emit('show-dialogue', {
@@ -407,6 +440,41 @@ export default class GameScene extends Phaser.Scene {
     this.wsClient.on('task_update', (data) => {
       // Server-driven task update
     });
+
+    // --- Multiplayer handlers ---
+    this.wsClient.on('players_list', (data) => {
+      for (const p of data.players || []) {
+        if (p.player_id !== this.player.player_id && !this.remotePlayers.has(p.player_id)) {
+          const remote = new RemotePlayer(this, p);
+          this.remotePlayers.set(p.player_id, remote);
+          console.log(`[MP] Existing player: ${p.player_id} (${p.name})`);
+        }
+      }
+    });
+
+    this.wsClient.on('player_join', (data) => {
+      if (data.player_id === this.player.player_id) return;
+      if (this.remotePlayers.has(data.player_id)) return;
+      const remote = new RemotePlayer(this, data);
+      this.remotePlayers.set(data.player_id, remote);
+      console.log(`[MP] Player joined: ${data.player_id} (${data.name})`);
+    });
+
+    this.wsClient.on('player_leave', (data) => {
+      const remote = this.remotePlayers.get(data.player_id);
+      if (remote) {
+        remote.destroy();
+        this.remotePlayers.delete(data.player_id);
+        console.log(`[MP] Player left: ${data.player_id}`);
+      }
+    });
+
+    this.wsClient.on('player_moved', (data) => {
+      const remote = this.remotePlayers.get(data.player_id);
+      if (remote) {
+        remote.updatePosition(data.x, data.y);
+      }
+    });
   }
 
   writeAgentConsole(npcName, debugLog) {
@@ -419,11 +487,31 @@ export default class GameScene extends Phaser.Scene {
 
     let lastToolName = '';
     for (const entry of debugLog) {
-      if (entry.type === 'tool_call') {
+      if (entry.type === 'memory') {
+        const status = entry.enabled ? 'ON' : 'OFF';
+        const detail = entry.enabled
+          ? `actor=${this.escapeHtml(entry.actor_id)}, session=${this.escapeHtml(entry.session_id)}`
+          : 'AGENTCORE_MEMORY_ID not set';
+        html += `<div class="log-entry log-memory">[Memory] ${status} — ${detail}</div>`;
+      } else if (entry.type === 'llm') {
+        html += `<div class="log-entry log-llm">[LLM] ${this.escapeHtml(entry.model_id)}`;
+        html += ` | region=${this.escapeHtml(entry.region)}`;
+        html += ` | cache=${entry.prompt_caching ? 'ON' : 'OFF'}`;
+        html += ` | npc=${this.escapeHtml(entry.npc)}</div>`;
+      } else if (entry.type === 'kb_query') {
+        const statusIcon = entry.status === 'ok' ? '✓' : entry.status === 'skipped' ? '⊘' : '✗';
+        html += `<div class="log-entry log-kb">[KB] ${statusIcon} "${this.escapeHtml(entry.query)}"`;
+        if (entry.status === 'ok') {
+          html += ` → ${entry.results} results (${entry.ms}ms)`;
+        } else {
+          html += ` → ${this.escapeHtml(entry.reason || entry.status)}`;
+        }
+        html += `</div>`;
+      } else if (entry.type === 'tool_call') {
         lastToolName = entry.name;
         const isGetter = entry.name.startsWith('get_');
         html += `<div class="log-entry log-tool-call">`;
-        html += `<span class="log-tool-name">${entry.name}</span>`;
+        html += `<span class="log-tool-name">[MCP Tool] ${entry.name}</span>`;
         if (entry.input && Object.keys(entry.input).length > 0) {
           if (isGetter) {
             html += `(${this.escapeHtml(JSON.stringify(entry.input))})`;
@@ -439,9 +527,17 @@ export default class GameScene extends Phaser.Scene {
         }
       } else if (entry.type === 'reasoning') {
         html += `<div class="log-entry log-reasoning">${this.escapeHtml(entry.text)}</div>`;
+      } else if (entry.type === 'data_prefetch') {
+        const icon = entry.source === 'KB' ? '📚' : entry.source === 'Memory' ? '🧠' : '🗄️';
+        const label = entry.label || (entry.queries ? entry.queries.join(', ') : entry.kb_id ? `monsters=${entry.monsters_from_kb}, items=${entry.items_from_kb}` : entry.source);
+        html += `<div class="log-entry log-prefetch">${icon} [${this.escapeHtml(entry.source)}] ${this.escapeHtml(label)} (${entry.ms}ms)</div>`;
+      } else if (entry.type === 'pre_generated') {
+        html += `<div class="log-entry log-prefetch">⚡ [Pre-Generated] event=${this.escapeHtml(entry.event_type)} (${entry.ms}ms — instant delivery)</div>`;
+      } else if (entry.type === 'error') {
+        html += `<div class="log-entry" style="color:#ff4444;">[Error] ${this.escapeHtml(entry.message)} (${entry.ms || 0}ms)</div>`;
       } else if (entry.type === 'timing') {
         const details = Object.entries(entry.details || {})
-          .map(([k, v]) => `${k}: ${v}ms`)
+          .map(([k, v]) => `${k}: ${v}${typeof v === 'number' ? 'ms' : ''}`)
           .join(', ');
         html += `<div class="log-entry log-timing">⏱ ${this.escapeHtml(entry.label)}: ${entry.total_ms}ms (${this.escapeHtml(details)})</div>`;
       }

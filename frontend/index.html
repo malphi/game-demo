@@ -59,14 +59,6 @@
       color: #fff;
       border-color: #888;
     }
-    #reset-btn {
-      border-color: #cc4444 !important;
-      color: #cc4444 !important;
-    }
-    #reset-btn:hover {
-      color: #ff6666 !important;
-      border-color: #ff6666 !important;
-    }
     #agent-console-body {
       flex: 1;
       overflow-y: auto;
@@ -122,6 +114,24 @@
       margin: 2px 0;
       font-size: 11px;
     }
+    .log-memory {
+      color: #cc88ff;
+      font-size: 11px;
+      border-left: 2px solid #cc88ff;
+      padding-left: 6px;
+    }
+    .log-llm {
+      color: #ff8844;
+      font-size: 11px;
+      border-left: 2px solid #ff8844;
+      padding-left: 6px;
+    }
+    .log-kb {
+      color: #44ddaa;
+      font-size: 11px;
+      border-left: 2px solid #44ddaa;
+      padding-left: 6px;
+    }
     .log-reasoning {
       color: #ffaa44;
       font-style: italic;
@@ -130,6 +140,12 @@
       color: #88ddff;
       font-size: 11px;
       border-left: 2px solid #88ddff;
+      padding-left: 6px;
+    }
+    .log-prefetch {
+      color: #88ccff;
+      font-size: 11px;
+      border-left: 2px solid #88ccff;
       padding-left: 6px;
     }
     .log-time {
@@ -143,37 +159,65 @@
   <div id="agent-console">
     <div id="agent-console-header">
       <span>Agent Console</span>
-      <div>
-        <button id="reset-btn" onclick="resetGame()">Reset</button>
+      <div id="login-area">
+        <input type="text" id="player-id-input" value="1" placeholder="Player ID" style="width:50px;background:#222;color:#fff;border:1px solid #555;padding:2px 6px;font-size:11px;border-radius:3px;font-family:monospace;">
+        <button id="login-btn" onclick="loginPlayer()">Login</button>
+        <button onclick="resetGame()" style="border-color:#ff8844 !important;color:#ff8844 !important;">Reset</button>
+        <button onclick="document.getElementById('agent-console-body').innerHTML=''">Clear</button>
+      </div>
+      <div id="logged-in-area" style="display:none;">
+        <span id="current-player-label" style="color:#88ff88;font-size:11px;"></span>
+        <button id="logout-btn" onclick="logoutPlayer()" style="border-color:#cc4444 !important;color:#cc4444 !important;">Logout</button>
+        <button onclick="resetGame()" style="border-color:#ff8844 !important;color:#ff8844 !important;">Reset</button>
         <button onclick="document.getElementById('agent-console-body').innerHTML=''">Clear</button>
       </div>
     </div>
     <div id="agent-console-body"></div>
   </div>
   <script>
-    async function resetGame() {
-      if (!confirm('确定要重置游戏吗？所有玩家数据、任务和事件记录将被清除。')) return;
-      const btn = document.getElementById('reset-btn');
-      btn.textContent = '...';
-      btn.disabled = true;
-      try {
-        const isDev = ['localhost', '127.0.0.1'].includes(window.location.hostname)
-          && ['3000', '3001'].includes(window.location.port);
-        const baseUrl = isDev ? `http://${window.location.hostname}:8080` : '';
-        const resp = await fetch(`${baseUrl}/api/game/reset`, { method: 'POST' });
-        const data = await resp.json();
-        if (data.success) {
-          document.getElementById('agent-console-body').innerHTML = '';
-          window.location.reload();
-        } else {
-          alert('重置失败: ' + data.message);
+    // Store globally so Phaser can read it
+    window.gamePlayerId = null;
+
+    function loginPlayer() {
+        const input = document.getElementById('player-id-input');
+        const playerId = input.value.trim();
+        if (!playerId) { alert('请输入Player ID'); return; }
+
+        window.gamePlayerId = playerId;
+        document.getElementById('login-area').style.display = 'none';
+        document.getElementById('logged-in-area').style.display = '';
+        document.getElementById('current-player-label').textContent = `Player: ${playerId}`;
+        document.getElementById('agent-console-body').innerHTML = '';
+
+        // Start or restart the game
+        window.startGame();
+    }
+
+    function logoutPlayer() {
+        window.gamePlayerId = null;
+        document.getElementById('login-area').style.display = '';
+        document.getElementById('logged-in-area').style.display = 'none';
+        if (window.gameInstance) {
+            window.gameInstance.destroy(true);
+            window.gameInstance = null;
         }
-      } catch (err) {
-        alert('重置失败: ' + err.message);
-      } finally {
-        btn.textContent = 'Reset';
-        btn.disabled = false;
-      }
+    }
+
+    async function resetGame() {
+        if (!confirm('Reset all game data? This will delete all players, tasks, and events.')) return;
+        try {
+            const resp = await fetch('/api/game/reset', { method: 'POST' });
+            const data = await resp.json();
+            if (data.success) {
+                document.getElementById('agent-console-body').innerHTML =
+                    '<div class="log-entry" style="color:#ff8844;">Game data reset. ' + data.message + '</div>';
+                logoutPlayer();
+            } else {
+                alert('Reset failed: ' + data.message);
+            }
+        } catch (err) {
+            alert('Reset error: ' + err.message);
+        }
     }
   </script>
   <script type="module" src="./src/main.js"></script>

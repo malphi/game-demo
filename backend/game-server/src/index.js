@@ -227,6 +227,27 @@ const wss = new WebSocketServer({
   path: '/ws',
 });
 
+// Connected players registry: ws -> { player_id, x, y, character, name }
+const connectedPlayers = new Map();
+
+function broadcastToOthers(senderWs, message) {
+  const msg = JSON.stringify(message);
+  for (const [ws] of connectedPlayers) {
+    if (ws !== senderWs && ws.readyState === 1) {
+      ws.send(msg);
+    }
+  }
+}
+
+function broadcastToAll(message) {
+  const msg = JSON.stringify(message);
+  for (const [ws] of connectedPlayers) {
+    if (ws.readyState === 1) {
+      ws.send(msg);
+    }
+  }
+}
+
 wss.on('connection', (ws, req) => {
   console.log('WebSocket client connected');
 
@@ -268,21 +289,46 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'player_move':
-          // Update player position
+          // Update player position and broadcast to others
           if (message.player_id) {
             await playerDataService.updatePlayer(message.player_id, {
               position_x: message.x,
               position_y: message.y,
             });
-            ws.send(
-              JSON.stringify({
-                type: 'player_move_ack',
-                x: message.x,
-                y: message.y,
-              })
-            );
+            // Update connectedPlayers registry
+            const pInfo = connectedPlayers.get(ws);
+            if (pInfo) {
+              pInfo.x = message.x;
+              pInfo.y = message.y;
+            }
+            // Broadcast position to other players
+            broadcastToOthers(ws, {
+              type: 'player_moved',
+              player_id: message.player_id,
+              x: message.x,
+              y: message.y,
+            });
           }
           break;
+
+        case 'player_register': {
+          const { player_id, x, y, character, name } = message;
+          if (!player_id) break;
+          const playerInfo = { player_id, x: x || 400, y: y || 300, character: character || 'player', name: name || player_id };
+          connectedPlayers.set(ws, playerInfo);
+          console.log(`[MP] Player registered: ${player_id} (${connectedPlayers.size} online)`);
+          // Send current online players list to the new player
+          const playersList = [];
+          for (const [otherWs, info] of connectedPlayers) {
+            if (otherWs !== ws) {
+              playersList.push(info);
+            }
+          }
+          ws.send(JSON.stringify({ type: 'players_list', players: playersList }));
+          // Broadcast new player to others
+          broadcastToOthers(ws, { type: 'player_join', ...playerInfo });
+          break;
+        }
 
         case 'ping':
           ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
@@ -308,7 +354,14 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
-    console.log('WebSocket client disconnected');
+    const playerInfo = connectedPlayers.get(ws);
+    if (playerInfo) {
+      connectedPlayers.delete(ws);
+      console.log(`[MP] Player disconnected: ${playerInfo.player_id} (${connectedPlayers.size} online)`);
+      broadcastToAll({ type: 'player_leave', player_id: playerInfo.player_id });
+    } else {
+      console.log('WebSocket client disconnected');
+    }
   });
 
   ws.on('error', (err) => {

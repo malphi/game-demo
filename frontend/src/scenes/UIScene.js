@@ -157,6 +157,7 @@ export default class UIScene extends Phaser.Scene {
     });
 
     // ---- Listen for events from GameScene ----
+    this.events.on('show-greeting', this.showGreeting, this);
     this.events.on('show-dialogue', this.showDialogue, this);
     this.events.on('task-completed-notify', this.onTaskCompleted, this);
     this.events.on('player-level-up-notify', this.onLevelUp, this);
@@ -215,6 +216,11 @@ export default class UIScene extends Phaser.Scene {
     if (this.gameScene && this.gameScene.player) {
       this.inventoryPanel.update(this.gameScene.player.inventory);
     }
+  }
+
+  showGreeting(data) {
+    const { npcName, greeting } = data;
+    this.dialogueBox.showGreeting(npcName, greeting);
   }
 
   showDialogue(data) {

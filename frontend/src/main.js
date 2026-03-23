@@ -26,6 +26,10 @@ const config = {
   roundPixels: true,
 };
 
-const game = new Phaser.Game(config);
-
-export default game;
+window.startGame = function () {
+  if (window.gameInstance) {
+    window.gameInstance.destroy(true);
+    window.gameInstance = null;
+  }
+  window.gameInstance = new Phaser.Game(config);
+};

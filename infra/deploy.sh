@@ -160,11 +160,21 @@ deploy_game_server_code() {
 
   if [[ -n "${instance_id}" && "${instance_id}" != "None" ]]; then
     echo ">>> Deploying code to EC2 instance: ${instance_id}"
+
+    # Sync AgentCore endpoint name to EC2 .env
+    local current_ep_name
+    current_ep_name=$(get_agentcore_endpoint_name 2>/dev/null || echo "")
+    local ep_update_cmd=""
+    if [[ -n "${current_ep_name}" ]]; then
+      echo "    Syncing AgentCore endpoint name: ${current_ep_name}"
+      ep_update_cmd="sed -i 's/AGENTCORE_ENDPOINT_NAME=.*/AGENTCORE_ENDPOINT_NAME=${current_ep_name}/' /opt/game-server/.env && "
+    fi
+
     local cmd_id
     cmd_id=$(aws ssm send-command \
       --instance-ids "${instance_id}" \
       --document-name AWS-RunShellScript \
-      --parameters "commands=[\"cd /opt/game-server && aws s3 cp s3://${artifact_bucket}/game-server/latest.zip ./code.zip --region ${REGION} && unzip -o code.zip && systemctl restart game-server\"]" \
+      --parameters "commands=[\"cd /opt/game-server && aws s3 cp s3://${artifact_bucket}/game-server/latest.zip ./code.zip --region ${REGION} && unzip -o code.zip && ${ep_update_cmd}systemctl restart game-server\"]" \
       --region "${REGION}" \
       --query "Command.CommandId" --output text)
 
@@ -253,7 +263,7 @@ deploy_agentcore() {
 
   # 1. Build and push container image for AgentCore
   echo "    Building NPC agent container image for AgentCore..."
-  docker build --platform linux/arm64 \
+  docker build --no-cache --platform linux/arm64 \
     -f "${PROJECT_ROOT}/backend/npc-agent/Dockerfile.agentcore" \
     -t npc-agent-agentcore:latest \
     "${PROJECT_ROOT}/backend/npc-agent"
@@ -302,7 +312,7 @@ deploy_agentcore() {
       --agent-runtime-artifact "{\"containerConfiguration\": {\"containerUri\": \"${container_uri}\"}}" \
       --role-arn "${agentcore_role_arn}" \
       --network-configuration "${vpc_network_config}" \
-      --environment-variables "{\"BEDROCK_MODEL_ID\": \"us.anthropic.claude-4-5-haiku-20251001-v1:0\", \"BEDROCK_REGION\": \"${REGION}\", \"AWS_REGION\": \"${REGION}\", \"ENV\": \"${ENV}\"}" \
+      --environment-variables "{\"BEDROCK_MODEL_ID\": \"us.anthropic.claude-haiku-4-5-20251001-v1:0\", \"BEDROCK_REGION\": \"${REGION}\", \"AWS_REGION\": \"${REGION}\", \"ENV\": \"${ENV}\"}" \
       --protocol-configuration '{"serverProtocol": "HTTP"}' \
       --query 'agentRuntimeId' \
       --output text --region "${REGION}")
@@ -314,7 +324,7 @@ deploy_agentcore() {
       --agent-runtime-artifact "{\"containerConfiguration\": {\"containerUri\": \"${container_uri}\"}}" \
       --role-arn "${agentcore_role_arn}" \
       --network-configuration "${vpc_network_config}" \
-      --environment-variables "{\"BEDROCK_MODEL_ID\": \"us.anthropic.claude-4-5-haiku-20251001-v1:0\", \"BEDROCK_REGION\": \"${REGION}\", \"AWS_REGION\": \"${REGION}\", \"ENV\": \"${ENV}\"}" \
+      --environment-variables "{\"BEDROCK_MODEL_ID\": \"us.anthropic.claude-haiku-4-5-20251001-v1:0\", \"BEDROCK_REGION\": \"${REGION}\", \"AWS_REGION\": \"${REGION}\", \"ENV\": \"${ENV}\"}" \
       --region "${REGION}" > /dev/null
     echo "    AgentCore runtime updated."
   fi
@@ -338,38 +348,60 @@ deploy_agentcore() {
     fi
   done
 
-  # 5. Create or get endpoint
-  local endpoint_arn
+  # 5. Delete existing endpoint and recreate (forces new container deployment)
+  local endpoint_arn endpoint_name
   endpoint_arn=$(aws bedrock-agentcore-control list-agent-runtime-endpoints \
     --agent-runtime-id "${runtime_id}" \
     --query "runtimeEndpoints[0].agentRuntimeEndpointArn" \
     --output text --region "${REGION}" 2>/dev/null || echo "None")
 
-  if [[ "${endpoint_arn}" == "None" || -z "${endpoint_arn}" ]]; then
-    echo "    Creating AgentCore runtime endpoint..."
-    endpoint_arn=$(aws bedrock-agentcore-control create-agent-runtime-endpoint \
+  if [[ "${endpoint_arn}" != "None" && -n "${endpoint_arn}" ]]; then
+    endpoint_name=$(aws bedrock-agentcore-control list-agent-runtime-endpoints \
       --agent-runtime-id "${runtime_id}" \
-      --name "game_demo_npc_agent_ep_${ENV}" \
-      --query 'agentRuntimeEndpointArn' \
-      --output text --region "${REGION}")
-    echo "    Endpoint created: ${endpoint_arn}"
+      --query "runtimeEndpoints[0].name" \
+      --output text --region "${REGION}" 2>/dev/null || echo "")
+    echo "    Deleting existing endpoint to force container redeploy: ${endpoint_arn}"
+    aws bedrock-agentcore-control delete-agent-runtime-endpoint \
+      --agent-runtime-endpoint-arn "${endpoint_arn}" \
+      --region "${REGION}" > /dev/null 2>&1 || true
 
-    # Wait for endpoint to be ready
-    echo "    Waiting for endpoint to be ready..."
-    local ep_status="CREATING"
+    # Wait for endpoint deletion
+    echo "    Waiting for endpoint deletion..."
+    local del_status="DELETING"
     waited=0
-    while [[ "${ep_status}" != "READY" && "${ep_status}" != "ACTIVE" && ${waited} -lt ${max_wait} ]]; do
-      sleep 10
-      waited=$((waited + 10))
-      ep_status=$(aws bedrock-agentcore-control get-agent-runtime-endpoint \
+    while [[ "${del_status}" == "DELETING" && ${waited} -lt ${max_wait} ]]; do
+      sleep 15
+      waited=$((waited + 15))
+      del_status=$(aws bedrock-agentcore-control get-agent-runtime-endpoint \
         --agent-runtime-endpoint-arn "${endpoint_arn}" \
         --query 'status' \
-        --output text --region "${REGION}" 2>/dev/null || echo "UNKNOWN")
-      echo "      Endpoint status: ${ep_status} (${waited}s)"
+        --output text --region "${REGION}" 2>/dev/null || echo "DELETED")
+      echo "      Deletion status: ${del_status} (${waited}s)"
     done
-  else
-    echo "    Using existing endpoint: ${endpoint_arn}"
   fi
+
+  echo "    Creating AgentCore runtime endpoint..."
+  local ep_name="game_demo_npc_agent_ep_${ENV}_${timestamp}"
+  endpoint_arn=$(aws bedrock-agentcore-control create-agent-runtime-endpoint \
+    --agent-runtime-id "${runtime_id}" \
+    --name "${ep_name}" \
+    --query 'agentRuntimeEndpointArn' \
+    --output text --region "${REGION}")
+  echo "    Endpoint created: ${endpoint_arn}"
+
+  # Wait for endpoint to be ready
+  echo "    Waiting for endpoint to be ready..."
+  local ep_status="CREATING"
+  waited=0
+  while [[ "${ep_status}" != "READY" && "${ep_status}" != "ACTIVE" && ${waited} -lt ${max_wait} ]]; do
+    sleep 10
+    waited=$((waited + 10))
+    ep_status=$(aws bedrock-agentcore-control get-agent-runtime-endpoint \
+      --agent-runtime-endpoint-arn "${endpoint_arn}" \
+      --query 'status' \
+      --output text --region "${REGION}" 2>/dev/null || echo "UNKNOWN")
+    echo "      Endpoint status: ${ep_status} (${waited}s)"
+  done
 
   echo "    AgentCore deployment complete."
   echo "    Endpoint ARN: ${endpoint_arn}"

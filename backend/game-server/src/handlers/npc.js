@@ -1,5 +1,6 @@
 const playerDataService = require('../services/PlayerDataService');
 const eventEmitter = require('../services/EventEmitter');
+const taskPreGenerator = require('../services/TaskPreGenerator');
 const { getNPC } = require('../models/NPC');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, QueryCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
@@ -92,10 +93,79 @@ async function handleNPCDialogue(ws, message) {
     console.warn(`[HANDLER] Failed to check existing tasks: ${err.message}`);
   }
 
-  // No active task from this NPC — call AgentCore for new dialogue + task
+  // Check pre-generated cache first (instant delivery!)
+  let preGenResult = taskPreGenerator.consumePreGenerated(player_id, npc_id);
+
+  // If not cached but a generation is in-flight, wait for it (still faster than cold call)
+  if (!preGenResult) {
+    const pendingPromise = taskPreGenerator.getPendingPromise(player_id);
+    if (pendingPromise) {
+      console.log(`[HANDLER] Waiting for in-flight pre-generation for player=${player_id}`);
+      await pendingPromise;
+      preGenResult = taskPreGenerator.consumePreGenerated(player_id, npc_id);
+    }
+  }
+
+  if (preGenResult) {
+    // Serve pre-generated result instantly
+    console.log(`[HANDLER] Serving pre-generated dialogue for player=${player_id}, npc=${npc_id}`);
+
+    // Send greeting based on the event that triggered pre-generation
+    const greetingResult = await callNPCAgentGreeting(player_id, npc_id).catch(err => {
+      console.warn('[HANDLER] Greeting call failed, skipping:', err.message);
+      return null;
+    });
+    if (greetingResult && greetingResult.greeting) {
+      ws.send(JSON.stringify({
+        type: 'npc_dialogue_greeting',
+        npc_id,
+        npc_name: greetingResult.npc_name || npc.name,
+        greeting: greetingResult.greeting,
+      }));
+    }
+
+    eventEmitter.logEvent(player_id, 'talk_to_npc', npc_id, 'success', { npc_name: npc.name });
+
+    const dialogueMsg = {
+      type: 'npc_dialogue_response',
+      npc_id: preGenResult.npc_id || npc_id,
+      npc_name: preGenResult.npc_name || npc.name,
+      dialogue: preGenResult.dialogue,
+      task: preGenResult.task || null,
+      debug_log: [
+        { type: 'pre_generated', event_type: preGenResult.event_type, ms: 0 },
+        ...(preGenResult.debug_log || []),
+      ],
+    };
+    console.log(`[WS:SEND] npc_dialogue_response (pre-generated): npc=${dialogueMsg.npc_name}, hasTask=${!!dialogueMsg.task}`);
+    ws.send(JSON.stringify(dialogueMsg));
+    return;
+  }
+
+  // Fallback: no pre-generated result — call greeting + dialogue in parallel
+  console.log(`[HANDLER] No pre-generated result, calling AgentCore directly for player=${player_id}`);
+  const greetingPromise = callNPCAgentGreeting(player_id, npc_id).catch(err => {
+    console.warn('[HANDLER] Greeting call failed, skipping:', err.message);
+    return null;
+  });
+  const dialoguePromise = callNPCAgentAgentCore(player_id, npc_id);
+
+  // Send greeting as soon as it's ready (masks LLM latency)
+  const greetingResult = await greetingPromise;
+  if (greetingResult && greetingResult.greeting) {
+    ws.send(JSON.stringify({
+      type: 'npc_dialogue_greeting',
+      npc_id,
+      npc_name: greetingResult.npc_name || npc.name,
+      greeting: greetingResult.greeting,
+    }));
+    console.log(`[WS:SEND] npc_dialogue_greeting: npc=${greetingResult.npc_name || npc.name}`);
+  }
+
+  // Wait for full dialogue result
   let dialogueResult;
   try {
-    dialogueResult = await callNPCAgentAgentCore(player_id, npc_id);
+    dialogueResult = await dialoguePromise;
   } catch (err) {
     console.error('[HANDLER] NPC Agent call failed:', err.message);
     ws.send(JSON.stringify({
@@ -196,15 +266,23 @@ async function handleTaskReject(ws, message) {
 }
 
 /**
- * Call the NPC Agent via AgentCore Runtime.
+ * Call the NPC Agent greeting via AgentCore Runtime (fast, ~100ms).
  */
-async function callNPCAgentAgentCore(playerId, npcId) {
+async function callNPCAgentGreeting(playerId, npcId) {
+  return callNPCAgentAgentCore(playerId, npcId, 'greeting');
+}
+
+/**
+ * Call the NPC Agent via AgentCore Runtime.
+ * @param {string} action - "dialogue" (default) or "greeting"
+ */
+async function callNPCAgentAgentCore(playerId, npcId, action = 'dialogue') {
   const { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } = require('@aws-sdk/client-bedrock-agentcore');
   const client = new BedrockAgentCoreClient({
     region: process.env.AWS_REGION || 'us-west-2',
   });
 
-  const payload = JSON.stringify({ player_id: playerId, npc_id: npcId });
+  const payload = JSON.stringify({ player_id: playerId, npc_id: npcId, action });
   const input = {
     agentRuntimeArn: process.env.AGENTCORE_RUNTIME_ARN,
     contentType: 'application/json',

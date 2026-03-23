@@ -19,8 +19,9 @@ export default class BootScene extends Phaser.Scene {
       })
       .setOrigin(0.5);
 
-    // Generate player texture
+    // Generate player textures
     this.generatePlayerTexture();
+    this.generatePlayerTexture2();
 
     // Generate monster textures
     for (const [id, data] of Object.entries(MONSTER_DICT)) {
@@ -118,6 +119,57 @@ export default class BootScene extends Phaser.Scene {
     ];
     this.drawPixelArt(gfx, map, palette);
     gfx.generateTexture('player', 24, 24);
+    gfx.destroy();
+  }
+
+  // ─── PLAYER 2 (24×24) ─── Female adventurer with pink hair, purple outfit ───
+
+  generatePlayerTexture2() {
+    const gfx = this.add.graphics();
+    const palette = {
+      h: 0xe84393, // pink hair
+      H: 0xc0392b, // dark hair edge
+      s: 0xffe0cc, // skin
+      e: 0xffffff, // eye white
+      p: 0x222244, // pupil
+      n: 0xd4a574, // nose shadow
+      m: 0xcc6677, // mouth/lips
+      b: 0x9b59b6, // purple dress
+      B: 0x8e44ad, // dark purple
+      c: 0xdddddd, // collar
+      T: 0xd4a017, // belt/ribbon
+      d: 0x444466, // dark leggings
+      o: 0x8b4513, // boots
+      O: 0x5c3310, // boot dark
+    };
+    const map = [
+      '.......hhhhh...........',
+      '......hhhhhhh..........',
+      '.....Hhhhhhhhhh........',
+      '.....Hhhhhhhhhhh.......',
+      '.....HhhhhhhhhhH.......',
+      '......hsssssssh........',
+      '.......seesseess.......',
+      '.......sppssppss.......',
+      '.......sssnssss........',
+      '........smmmss.........',
+      '........ssssss.........',
+      '.........cccc..........',
+      '........bBBBBb.........',
+      '.......bBBBBBBb........',
+      '......ssbBTBBbss.......',
+      '.......bBBBBBBb........',
+      '.......bBBBBBBb........',
+      '........bBBBBb.........',
+      '........dddddd.........',
+      '.......dd...dd.........',
+      '.......dd...dd.........',
+      '.......oo...oo.........',
+      '.......OO...OO.........',
+      '........................',
+    ];
+    this.drawPixelArt(gfx, map, palette);
+    gfx.generateTexture('player_2', 24, 24);
     gfx.destroy();
   }
 

@@ -1,4 +1,5 @@
 const playerDataService = require('../services/PlayerDataService');
+const taskPreGenerator = require('../services/TaskPreGenerator');
 
 /**
  * Session management handlers.
@@ -28,6 +29,12 @@ async function handleGameStart(req, res) {
       // Create new player
       player = await playerDataService.createPlayer(name);
     }
+
+    // Trigger async pre-generation on login (generate first task for new players)
+    taskPreGenerator.triggerPreGeneration(player.player_id, 'player_login', {
+      is_new: !player_id || !player.completed_tasks || player.completed_tasks.length === 0,
+      player_level: player.level,
+    });
 
     return res.json({
       success: true,
