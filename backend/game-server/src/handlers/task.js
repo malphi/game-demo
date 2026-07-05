@@ -210,7 +210,7 @@ async function handleUseItem(ws, message) {
   taskPreGenerator.triggerPreGeneration(player_id, 'item_used', {
     item_id,
     effect: result.effect,
-  });
+  }, ws);
 }
 
 module.exports = {

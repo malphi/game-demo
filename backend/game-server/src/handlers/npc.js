@@ -59,12 +59,11 @@ async function handleNPCDialogue(ws, message) {
     player = await playerDataService.createPlayer(player_id, player_id);
   }
 
-  // Check existing tasks from this NPC — skip AgentCore if found
+  // Check existing in_progress tasks — skip AgentCore if found
   try {
     const npcTasks = await getPlayerTasksFromNPC(player_id, npc_id);
     for (const task of npcTasks) {
-      const status = task.status;
-      if (status === 'in_progress') {
+      if (task.status === 'in_progress') {
         console.log(`[HANDLER] Player has in_progress task '${task.title}' from ${npc_id}, skipping AgentCore`);
         ws.send(JSON.stringify({
           type: 'npc_dialogue_response',
@@ -76,29 +75,19 @@ async function handleNPCDialogue(ws, message) {
         }));
         return;
       }
-      if (status === 'pending') {
-        console.log(`[HANDLER] Player has pending task '${task.title}' from ${npc_id}, skipping AgentCore`);
-        ws.send(JSON.stringify({
-          type: 'npc_dialogue_response',
-          npc_id,
-          npc_name: npc.name,
-          dialogue: `我刚才给你说的任务「${task.title}」，你还没接受呢，要不要接？`,
-          task: task,
-          debug_log: [],
-        }));
-        return;
-      }
     }
   } catch (err) {
     console.warn(`[HANDLER] Failed to check existing tasks: ${err.message}`);
   }
 
   // Check pre-generated cache first (instant delivery!)
+  // This is checked BEFORE pending tasks because pre-generation creates tasks as
+  // "pending" in DynamoDB, and the pre-generated dialogue describes the task naturally.
   let preGenResult = taskPreGenerator.consumePreGenerated(player_id, npc_id);
 
   // If not cached but a generation is in-flight, wait for it (still faster than cold call)
   if (!preGenResult) {
-    const pendingPromise = taskPreGenerator.getPendingPromise(player_id);
+    const pendingPromise = taskPreGenerator.getPendingPromise(player_id, npc_id);
     if (pendingPromise) {
       console.log(`[HANDLER] Waiting for in-flight pre-generation for player=${player_id}`);
       await pendingPromise;
@@ -140,6 +129,26 @@ async function handleNPCDialogue(ws, message) {
     console.log(`[WS:SEND] npc_dialogue_response (pre-generated): npc=${dialogueMsg.npc_name}, hasTask=${!!dialogueMsg.task}`);
     ws.send(JSON.stringify(dialogueMsg));
     return;
+  }
+
+  // Check for pending tasks (created by pre-gen but cache expired/missed)
+  try {
+    const npcTasks = await getPlayerTasksFromNPC(player_id, npc_id);
+    const pendingTask = npcTasks.find(t => t.status === 'pending');
+    if (pendingTask) {
+      console.log(`[HANDLER] Player has pending task '${pendingTask.title}' from ${npc_id}, serving directly`);
+      ws.send(JSON.stringify({
+        type: 'npc_dialogue_response',
+        npc_id,
+        npc_name: npc.name,
+        dialogue: pendingTask.description || `我这里有个任务给你：「${pendingTask.title}」`,
+        task: pendingTask,
+        debug_log: [],
+      }));
+      return;
+    }
+  } catch (err) {
+    console.warn(`[HANDLER] Failed to check pending tasks: ${err.message}`);
   }
 
   // Fallback: no pre-generated result — call greeting + dialogue in parallel

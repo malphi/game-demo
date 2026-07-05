@@ -47,8 +47,28 @@ Parameters:
     Default: us-west-2
     Description: AWS region for Bedrock API calls
 
+  CloudFrontPrefixListId:
+    Type: String
+    Default: ''
+    Description: >
+      CloudFront origin-facing managed prefix list ID (e.g. pl-xxxxxxxx) for the
+      deploy region. Used to restrict the internal ALB security group so only
+      CloudFront edge servers can reach it. Leave empty on first deploy; deploy.sh
+      resolves and injects it automatically.
+
+  CloudFrontVpcOriginSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: >
+      The AWS service-managed security group (CloudFront-VPCOrigins-Service-SG)
+      created after the VPC origin exists. When provided, the ALB security group
+      is tightened to allow inbound ONLY from this SG (most restrictive). Leave
+      empty until the VPC origin has been created.
+
 Conditions:
   HasAgentCoreRuntime: !Not [!Equals [!Ref AgentCoreRuntimeArn, '']]
+  HasCloudFrontPrefixList: !Not [!Equals [!Ref CloudFrontPrefixListId, '']]
+  HasCloudFrontVpcOriginSG: !Not [!Equals [!Ref CloudFrontVpcOriginSecurityGroupId, '']]
 
 # =============================================================================
 # Resources
@@ -299,6 +319,19 @@ Resources:
       SecurityGroupIds:
         - !Ref VPCEndpointSecurityGroup
 
+  BedrockAgentRuntimeEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.bedrock-agent-runtime'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
   STSEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
@@ -356,12 +389,62 @@ Resources:
   GameServerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for game server EC2 (SSM access only, no inbound needed)
+      GroupDescription: Security group for game server EC2 (inbound from ALB only)
       VpcId: !Ref VPC
-      # No inbound rules — access via SSM Session Manager port forwarding only
+      # Only the internal ALB may reach the game server on port 8080.
+      # SSM Session Manager port forwarding still works for debugging (no inbound rule needed).
       Tags:
         - Key: Name
           Value: !Sub 'game-demo-gs-sg-${Environment}'
+
+  GameServerFromALBIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref GameServerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Description: Allow game traffic from the internal ALB only
+
+  # --- Internal ALB security group (CloudFront is the only allowed source) ---
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the internal ALB fronting the game server
+      VpcId: !Ref VPC
+      # No static ingress here — ingress is attached conditionally below so the
+      # allowed source can be tightened over two deploy phases:
+      #   Phase 1: CloudFront origin-facing managed prefix list (edge IPs only)
+      #   Phase 2: CloudFront-VPCOrigins-Service-SG (most restrictive, this distribution only)
+      Tags:
+        - Key: Name
+          Value: !Sub 'game-demo-alb-sg-${Environment}'
+
+  # Phase 1 ingress: allow only CloudFront edge servers via the managed prefix list.
+  ALBIngressFromCloudFrontPrefixList:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCloudFrontPrefixList
+    Properties:
+      GroupId: !Ref ALBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourcePrefixListId: !Ref CloudFrontPrefixListId
+      Description: Allow HTTP from CloudFront edge servers (managed prefix list)
+
+  # Phase 2 ingress: tighten to the CloudFront service-managed VPC origin SG once it exists.
+  ALBIngressFromVpcOriginSG:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCloudFrontVpcOriginSG
+    Properties:
+      GroupId: !Ref ALBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref CloudFrontVpcOriginSecurityGroupId
+      Description: Allow HTTP only from CloudFront VPC origin service-managed SG
 
   # ===========================================================================
   # Game Server — EC2 + Auto Scaling Group
@@ -372,7 +455,7 @@ Resources:
   GameServerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub 'game-demo-game-server-${Environment}'
+      RoleName: !Sub 'game-demo-game-server-${AWS::Region}-${Environment}'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -432,7 +515,7 @@ Resources:
   GameServerInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
-      InstanceProfileName: !Sub 'game-demo-game-server-${Environment}'
+      InstanceProfileName: !Sub 'game-demo-game-server-${AWS::Region}-${Environment}'
       Roles:
         - !Ref GameServerRole
 
@@ -523,19 +606,122 @@ Resources:
       VPCZoneIdentifier:
         - !Ref PrivateSubnet1
         - !Ref PrivateSubnet2
-      HealthCheckType: EC2
+      TargetGroupARNs:
+        - !Ref GameServerTargetGroup
+      HealthCheckType: ELB
       HealthCheckGracePeriod: 300
       Tags:
         - Key: Project
           Value: game-demo
           PropagateAtLaunch: false
 
+  # ===========================================================================
+  # Internal ALB + CloudFront VPC Origin (public entry point)
+  # ===========================================================================
+
+  GameServerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub 'game-demo-tg-${Environment}'
+      VpcId: !Ref VPC
+      Port: 8080
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        # Sticky sessions keep a client pinned to the instance holding its WebSocket.
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Project
+          Value: game-demo
+
+  GameServerALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub 'game-demo-alb-${Environment}'
+      Type: application
+      Scheme: internal
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Project
+          Value: game-demo
+
+  GameServerALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref GameServerALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GameServerTargetGroup
+
+  # VPC origin: CloudFront reaches the internal ALB over a private service-managed ENI.
+  GameServerVpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: !Sub 'game-demo-vpcorigin-${Environment}'
+        Arn: !Ref GameServerALB
+        HTTPPort: 80
+        OriginProtocolPolicy: http-only
+      Tags:
+        - Key: Project
+          Value: game-demo
+
+  GameServerDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'game-demo ${Environment} — single entry point'
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: game-server-alb
+            DomainName: !GetAtt GameServerALB.DNSName
+            VpcOriginConfig:
+              VpcOriginId: !GetAtt GameServerVpcOrigin.Id
+              # NPC dialogue can take ~5-7s; keep the origin connection alive and read window wide.
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: game-server-alb
+          ViewerProtocolPolicy: redirect-to-https
+          # WebSocket + mutating API calls need the full HTTP verb set.
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: false
+          # AWS managed policies: CachingDisabled (no cache) + AllViewerExceptHostHeader
+          # (forwards all viewer headers/cookies/query strings except Host — required for
+          # WebSocket Upgrade/Connection/Sec-WebSocket-* and correct ALB routing).
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
   # --- AgentCore Runtime IAM Role (for NPC agent running on AgentCore) ---
 
   AgentCoreRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub 'game-demo-agentcore-${Environment}'
+      RoleName: !Sub 'game-demo-agentcore-${AWS::Region}-${Environment}'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -578,6 +764,31 @@ Resources:
                   - bedrock:InvokeModel
                   - bedrock:InvokeModelWithResponseStream
                 Resource: '*'
+        - PolicyName: AgentCoreMemoryAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:CreateEvent
+                  - bedrock-agentcore:ListEvents
+                  - bedrock-agentcore:GetMemory
+                  - bedrock-agentcore:RetrieveMemory
+                  - bedrock-agentcore:GetConversationTree
+                Resource: '*'
+        - PolicyName: BedrockKBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: '*'
         - PolicyName: ECRPullAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -597,7 +808,7 @@ Resources:
   AgentCoreArtifactBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub 'game-demo-agentcore-${AWS::AccountId}-${Environment}'
+      BucketName: !Sub 'game-demo-agentcore-${AWS::AccountId}-${AWS::Region}-${Environment}'
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -792,3 +1003,15 @@ Outputs:
   AgentCoreSecurityGroupId:
     Description: Security group ID for AgentCore Runtime (VPC mode)
     Value: !Ref AgentCoreSecurityGroup
+
+  CloudFrontDomainName:
+    Description: Public URL to access the game (CloudFront distribution domain)
+    Value: !Sub 'https://${GameServerDistribution.DomainName}'
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref GameServerDistribution
+
+  VpcOriginId:
+    Description: CloudFront VPC origin ID
+    Value: !GetAtt GameServerVpcOrigin.Id

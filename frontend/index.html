@@ -204,13 +204,19 @@
     }
 
     async function resetGame() {
-        if (!confirm('Reset all game data? This will delete all players, tasks, and events.')) return;
+        const playerId = window.gamePlayerId || document.getElementById('player-id-input').value.trim();
+        if (!playerId) { alert('请先输入 Player ID'); return; }
+        if (!confirm('Reset player "' + playerId + '" data? This will delete this player\'s tasks and events.')) return;
         try {
-            const resp = await fetch('/api/game/reset', { method: 'POST' });
+            const resp = await fetch('/api/game/reset', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ player_id: playerId }),
+            });
             const data = await resp.json();
             if (data.success) {
                 document.getElementById('agent-console-body').innerHTML =
-                    '<div class="log-entry" style="color:#ff8844;">Game data reset. ' + data.message + '</div>';
+                    '<div class="log-entry" style="color:#ff8844;">Player ' + playerId + ' reset. ' + data.message + '</div>';
                 logoutPlayer();
             } else {
                 alert('Reset failed: ' + data.message);

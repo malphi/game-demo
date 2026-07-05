@@ -8,20 +8,20 @@ from validation.task_validator import validate_task
 
 logger = logging.getLogger(__name__)
 
+# Per-request guard using mutable dict (avoids global keyword issues with @tool decorator).
+# Reset before each agent call via reset_create_task_guard().
+_guard = {"created": False}
+
+
+def reset_create_task_guard():
+    """Reset the create_task one-shot guard. Call before each agent invocation."""
+    _guard["created"] = False
+
 
 @tool
 def create_task(task_data: dict) -> dict:
     """
-    校验并创建任务。这是最关键的 Tool，所有 AI 生成的任务都必须通过此接口创建。
-
-    校验内容包括：
-    - 结构完整性：title, description, conditions, awards 必须存在且非空
-    - npc_id 必须在 NPCs 字典表中存在
-    - conditions 中的 type 必须是 kill_monster / collect_item / talk_to_npc / use_item
-    - conditions 中的 target_id 必须在对应的字典表中真实存在
-    - awards 中 type=item 时 item_id 必须在 Items 表中存在
-    - 数值范围：金币 1-1000, 经验 1-500, 数量 1-99, required_count 1-99
-    - 不能与玩家进行中的任务有相同的 conditions 组合
+    校验并创建任务。每次对话只能调用一次，重复调用会被拒绝。
 
     校验通过后自动生成 task_id 并写入 Tasks 表。
 
@@ -46,6 +46,11 @@ def create_task(task_data: dict) -> dict:
         - 成功: {"success": True, "task_id": "生成的任务ID"}
         - 失败: {"success": False, "reason": ["校验失败原因列表"]}
     """
+    # 0. One-shot guard: only allow one task creation per agent invocation
+    if _guard["created"]:
+        logger.info("create_task blocked: task already created in this invocation")
+        return {"success": False, "reason": ["本次对话已创建过任务，不可重复创建"]}
+
     # 1. 执行任务校验
     validation_result = validate_task(task_data)
 
@@ -92,6 +97,7 @@ def create_task(task_data: dict) -> dict:
             f"title={task_data['title']}"
         )
 
+        _guard["created"] = True
         return {
             "success": True,
             "task_id": task_id,

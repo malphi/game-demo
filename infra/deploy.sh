@@ -61,6 +61,13 @@ STACK_NAME="${STACK_NAME:-game-demo-${ENV}}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "${REGION}")
 ECR_BASE="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
 
+# Select Bedrock model ID based on region
+if [[ "${REGION}" == us-* ]]; then
+  BEDROCK_MODEL_ID="us.anthropic.claude-haiku-4-5-20251001-v1:0"
+else
+  BEDROCK_MODEL_ID="global.anthropic.claude-haiku-4-5-20251001-v1:0"
+fi
+
 echo "=============================================="
 echo "  Game Demo — AWS Deployment"
 echo "=============================================="
@@ -83,6 +90,23 @@ deploy_stack() {
   agentcore_runtime_arn=$(get_agentcore_runtime_arn 2>/dev/null || echo "")
   agentcore_endpoint_name=$(get_agentcore_endpoint_name 2>/dev/null || echo "")
 
+  # Resolve the CloudFront origin-facing managed prefix list for this region.
+  # Restricts the internal ALB security group to CloudFront edge servers only.
+  local cf_prefix_list_id=""
+  cf_prefix_list_id=$(aws ec2 describe-managed-prefix-lists \
+    --filters "Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing" \
+    --query "PrefixLists[0].PrefixListId" \
+    --output text --region "${REGION}" 2>/dev/null || echo "")
+  [[ "${cf_prefix_list_id}" == "None" ]] && cf_prefix_list_id=""
+
+  # If the VPC origin already exists, resolve its service-managed SG to tighten the ALB
+  # ingress further (Phase 2). Empty on first deploy.
+  local cf_vpcorigin_sg=""
+  cf_vpcorigin_sg=$(get_cloudfront_vpcorigin_sg 2>/dev/null || echo "")
+
+  echo "    CloudFront prefix list: ${cf_prefix_list_id:-<none>}"
+  echo "    CloudFront VPC origin SG: ${cf_vpcorigin_sg:-<none, phase 1>}"
+
   aws cloudformation deploy \
     --template-file "${SCRIPT_DIR}/deploy.yaml" \
     --stack-name "${STACK_NAME}" \
@@ -90,12 +114,34 @@ deploy_stack() {
       Environment="${ENV}" \
       AgentCoreRuntimeArn="${agentcore_runtime_arn}" \
       AgentCoreEndpointName="${agentcore_endpoint_name}" \
+      CloudFrontPrefixListId="${cf_prefix_list_id}" \
+      CloudFrontVpcOriginSecurityGroupId="${cf_vpcorigin_sg}" \
     --capabilities CAPABILITY_NAMED_IAM \
     --region "${REGION}" \
     --no-fail-on-empty-changeset
 
   echo "    Stack deployed successfully."
   echo ""
+}
+
+# Resolve the CloudFront service-managed VPC origin security group.
+# AWS auto-creates "CloudFront-VPCOrigins-Service-SG" once a VPC origin exists.
+get_cloudfront_vpcorigin_sg() {
+  local sg_id
+  sg_id=$(aws ec2 describe-security-groups \
+    --filters "Name=vpc-id,Values=$(get_vpc_id)" \
+              "Name=group-name,Values=CloudFront-VPCOrigins-Service-SG" \
+    --query "SecurityGroups[0].GroupId" \
+    --output text --region "${REGION}" 2>/dev/null || echo "")
+  [[ "${sg_id}" == "None" ]] && sg_id=""
+  echo "${sg_id}"
+}
+
+get_vpc_id() {
+  aws cloudformation describe-stacks \
+    --stack-name "${STACK_NAME}" \
+    --query "Stacks[0].Outputs[?OutputKey=='VPCId'].OutputValue" \
+    --output text --region "${REGION}" 2>/dev/null || echo ""
 }
 
 # ---------------------------------------------------------------------------
@@ -312,7 +358,7 @@ deploy_agentcore() {
       --agent-runtime-artifact "{\"containerConfiguration\": {\"containerUri\": \"${container_uri}\"}}" \
       --role-arn "${agentcore_role_arn}" \
       --network-configuration "${vpc_network_config}" \
-      --environment-variables "{\"BEDROCK_MODEL_ID\": \"us.anthropic.claude-haiku-4-5-20251001-v1:0\", \"BEDROCK_REGION\": \"${REGION}\", \"AWS_REGION\": \"${REGION}\", \"ENV\": \"${ENV}\"}" \
+      --environment-variables "{\"BEDROCK_MODEL_ID\": \"${BEDROCK_MODEL_ID}\", \"BEDROCK_REGION\": \"${REGION}\", \"AWS_REGION\": \"${REGION}\", \"ENV\": \"${ENV}\", \"AGENTCORE_MEMORY_ID\": \"game_demo_npc_memory-PY4RBnGoHo\", \"BEDROCK_KB_ID\": \"GIMX2WDALO\"}" \
       --protocol-configuration '{"serverProtocol": "HTTP"}' \
       --query 'agentRuntimeId' \
       --output text --region "${REGION}")
@@ -324,7 +370,7 @@ deploy_agentcore() {
       --agent-runtime-artifact "{\"containerConfiguration\": {\"containerUri\": \"${container_uri}\"}}" \
       --role-arn "${agentcore_role_arn}" \
       --network-configuration "${vpc_network_config}" \
-      --environment-variables "{\"BEDROCK_MODEL_ID\": \"us.anthropic.claude-haiku-4-5-20251001-v1:0\", \"BEDROCK_REGION\": \"${REGION}\", \"AWS_REGION\": \"${REGION}\", \"ENV\": \"${ENV}\"}" \
+      --environment-variables "{\"BEDROCK_MODEL_ID\": \"${BEDROCK_MODEL_ID}\", \"BEDROCK_REGION\": \"${REGION}\", \"AWS_REGION\": \"${REGION}\", \"ENV\": \"${ENV}\", \"AGENTCORE_MEMORY_ID\": \"game_demo_npc_memory-PY4RBnGoHo\", \"BEDROCK_KB_ID\": \"GIMX2WDALO\"}" \
       --region "${REGION}" > /dev/null
     echo "    AgentCore runtime updated."
   fi
@@ -360,9 +406,10 @@ deploy_agentcore() {
       --agent-runtime-id "${runtime_id}" \
       --query "runtimeEndpoints[0].name" \
       --output text --region "${REGION}" 2>/dev/null || echo "")
-    echo "    Deleting existing endpoint to force container redeploy: ${endpoint_arn}"
+    echo "    Deleting existing endpoint to force container redeploy: ${endpoint_name}"
     aws bedrock-agentcore-control delete-agent-runtime-endpoint \
-      --agent-runtime-endpoint-arn "${endpoint_arn}" \
+      --agent-runtime-id "${runtime_id}" \
+      --endpoint-name "${endpoint_name}" \
       --region "${REGION}" > /dev/null 2>&1 || true
 
     # Wait for endpoint deletion
@@ -372,10 +419,13 @@ deploy_agentcore() {
     while [[ "${del_status}" == "DELETING" && ${waited} -lt ${max_wait} ]]; do
       sleep 15
       waited=$((waited + 15))
-      del_status=$(aws bedrock-agentcore-control get-agent-runtime-endpoint \
-        --agent-runtime-endpoint-arn "${endpoint_arn}" \
-        --query 'status' \
+      del_status=$(aws bedrock-agentcore-control list-agent-runtime-endpoints \
+        --agent-runtime-id "${runtime_id}" \
+        --query "runtimeEndpoints[?name=='${endpoint_name}'].status | [0]" \
         --output text --region "${REGION}" 2>/dev/null || echo "DELETED")
+      if [[ "${del_status}" == "None" || -z "${del_status}" ]]; then
+        del_status="DELETED"
+      fi
       echo "      Deletion status: ${del_status} (${waited}s)"
     done
   fi
@@ -396,9 +446,9 @@ deploy_agentcore() {
   while [[ "${ep_status}" != "READY" && "${ep_status}" != "ACTIVE" && ${waited} -lt ${max_wait} ]]; do
     sleep 10
     waited=$((waited + 10))
-    ep_status=$(aws bedrock-agentcore-control get-agent-runtime-endpoint \
-      --agent-runtime-endpoint-arn "${endpoint_arn}" \
-      --query 'status' \
+    ep_status=$(aws bedrock-agentcore-control list-agent-runtime-endpoints \
+      --agent-runtime-id "${runtime_id}" \
+      --query "runtimeEndpoints[?name=='${ep_name}'].status | [0]" \
       --output text --region "${REGION}" 2>/dev/null || echo "UNKNOWN")
     echo "      Endpoint status: ${ep_status} (${waited}s)"
   done
@@ -420,6 +470,60 @@ seed_tables() {
 }
 
 # ---------------------------------------------------------------------------
+# Step 6: Sync AgentCore endpoint name + runtime ARN to EC2 .env
+# ---------------------------------------------------------------------------
+sync_agentcore_endpoint_to_ec2() {
+  echo ">>> Syncing AgentCore config to EC2 .env"
+
+  local current_ep_name current_runtime_arn
+  current_ep_name=$(get_agentcore_endpoint_name 2>/dev/null || echo "")
+  current_runtime_arn=$(get_agentcore_runtime_arn 2>/dev/null || echo "")
+
+  if [[ -z "${current_ep_name}" && -z "${current_runtime_arn}" ]]; then
+    echo "    No AgentCore endpoint/runtime found, skipping."
+    echo ""
+    return
+  fi
+
+  local asg_name instance_id
+  asg_name=$(aws cloudformation describe-stacks \
+    --stack-name "${STACK_NAME}" \
+    --query "Stacks[0].Outputs[?OutputKey=='GameServerASGName'].OutputValue" \
+    --output text --region "${REGION}")
+
+  instance_id=$(aws autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "${asg_name}" \
+    --query "AutoScalingGroups[0].Instances[0].InstanceId" \
+    --output text --region "${REGION}")
+
+  if [[ -z "${instance_id}" || "${instance_id}" == "None" ]]; then
+    echo "    No running EC2 instance found, skipping."
+    echo ""
+    return
+  fi
+
+  local sed_cmds=""
+  if [[ -n "${current_ep_name}" ]]; then
+    echo "    Endpoint name: ${current_ep_name}"
+    sed_cmds="sed -i 's|AGENTCORE_ENDPOINT_NAME=.*|AGENTCORE_ENDPOINT_NAME=${current_ep_name}|' /opt/game-server/.env"
+  fi
+  if [[ -n "${current_runtime_arn}" ]]; then
+    echo "    Runtime ARN: ${current_runtime_arn}"
+    [[ -n "${sed_cmds}" ]] && sed_cmds="${sed_cmds} && "
+    sed_cmds="${sed_cmds}sed -i 's|AGENTCORE_RUNTIME_ARN=.*|AGENTCORE_RUNTIME_ARN=${current_runtime_arn}|' /opt/game-server/.env"
+  fi
+
+  aws ssm send-command \
+    --instance-ids "${instance_id}" \
+    --document-name AWS-RunShellScript \
+    --parameters "commands=[\"${sed_cmds} && systemctl restart game-server\"]" \
+    --region "${REGION}" > /dev/null
+
+  echo "    EC2 .env updated and game-server restarted."
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
 
@@ -436,8 +540,12 @@ else
   deploy_stack
   deploy_game_server_code
   deploy_agentcore
-  # Re-deploy stack with AgentCore endpoint now available
+  # Re-deploy stack: picks up AgentCore endpoint AND tightens the ALB security group
+  # from the CloudFront prefix list (phase 1) to the VPC origin service-managed SG
+  # (phase 2) if it has been created by now. Security is enforced in both phases.
   deploy_stack
+  # Sync AgentCore endpoint name to EC2 (was empty during initial game server deploy)
+  sync_agentcore_endpoint_to_ec2
   seed_tables
 fi
 
@@ -446,7 +554,13 @@ echo "=============================================="
 echo "  Deployment Complete!"
 echo "=============================================="
 
-# Get EC2 instance ID for SSM access
+# Public access URL via CloudFront
+CF_URL=$(aws cloudformation describe-stacks \
+  --stack-name "${STACK_NAME}" \
+  --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDomainName'].OutputValue" \
+  --output text --region "${REGION}" 2>/dev/null || echo "N/A")
+
+# Get EC2 instance ID for SSM (debug) access
 INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
   --auto-scaling-group-names "$(aws cloudformation describe-stacks \
     --stack-name "${STACK_NAME}" \
@@ -455,14 +569,19 @@ INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
   --query "AutoScalingGroups[0].Instances[0].InstanceId" \
   --output text --region "${REGION}" 2>/dev/null || echo "N/A")
 
-echo "  EC2 Instance: ${INSTANCE_ID}"
 echo ""
-echo "  Access via SSM port forwarding:"
+echo "  >>> Play the game at:"
+echo "        ${CF_URL}"
+echo ""
+echo "  (CloudFront can take ~10-15 min to finish deploying on first create.)"
+echo ""
+echo "  ----------------------------------------------"
+echo "  EC2 Instance: ${INSTANCE_ID}"
+echo "  Debug access via SSM port forwarding (optional):"
 echo "    aws ssm start-session \\"
 echo "      --target ${INSTANCE_ID} \\"
 echo "      --document-name AWS-StartPortForwardingSession \\"
 echo "      --parameters '{\"portNumber\":[\"8080\"],\"localPortNumber\":[\"8080\"]}' \\"
 echo "      --region ${REGION}"
-echo ""
-echo "  Then open: http://localhost:8080"
+echo "    Then open: http://localhost:8080"
 echo "=============================================="

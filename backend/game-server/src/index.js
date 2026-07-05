@@ -15,6 +15,7 @@ const playerDataService = require('./services/PlayerDataService');
 const InventoryManager = require('./services/InventoryManager');
 const eventEmitter = require('./services/EventEmitter');
 const taskManager = require('./services/TaskManager');
+const taskPreGenerator = require('./services/TaskPreGenerator');
 
 // Models (loaded at startup to verify dictionary data)
 const { getAllMonsters, getMonster } = require('./models/Monster');
@@ -55,6 +56,11 @@ async function handleTaskComplete(ws, message) {
   }
 
   ws.send(JSON.stringify({ type: 'task_completed_ack', task_id }));
+
+  // Trigger pre-generation now that the task is completed in DynamoDB
+  taskPreGenerator.triggerPreGeneration(player_id, 'task_completed', {
+    task_id,
+  }, ws);
 }
 
 // ---- Express App Setup ----
@@ -129,69 +135,90 @@ app.get('/api/player/:id/inventory', async (req, res) => {
 app.get('/api/tasks/:playerId', handleGetTasks);
 app.post('/api/tasks/:taskId/complete', handleCompleteTask);
 
-// Reset game data (clear in-memory + DynamoDB player-related tables)
+// Reset game data for a specific player
 app.post('/api/game/reset', async (req, res) => {
   try {
-    // Always clear in-memory store
-    playerDataService.players.clear();
-    taskManager.clearAll && taskManager.clearAll();
-    eventEmitter.clearAll && eventEmitter.clearAll();
+    const { player_id } = req.body || {};
+    if (!player_id) {
+      return res.status(400).json({ success: false, message: 'player_id is required' });
+    }
 
-    // Always clear DynamoDB tables (NPC Agent reads tasks from DynamoDB directly)
-    const { DynamoDBClient, ScanCommand, BatchWriteItemCommand } = require('@aws-sdk/client-dynamodb');
+    console.log(`[RESET] Resetting data for player: ${player_id}`);
+
+    // Clear in-memory data for this player
+    playerDataService.players.delete(player_id);
+    taskManager.clearPlayer && taskManager.clearPlayer(player_id);
+    eventEmitter.clearPlayer && eventEmitter.clearPlayer(player_id);
+    taskPreGenerator.clearPlayer(player_id);
+
+    // Clear DynamoDB data for this player
+    const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+    const { DynamoDBDocumentClient, DeleteCommand, QueryCommand, ScanCommand, BatchWriteItemCommand } = require('@aws-sdk/lib-dynamodb');
     const config = { region: process.env.AWS_REGION || 'us-west-2' };
     if (process.env.DYNAMODB_ENDPOINT) {
       config.endpoint = process.env.DYNAMODB_ENDPOINT;
     }
-    const ddbClient = new DynamoDBClient(config);
+    const docClient = DynamoDBDocumentClient.from(new DynamoDBClient(config));
 
     const env = process.env.ENV || 'dev';
-    const tables = [
-      { name: `Players-${env}`, keyAttrs: ['player_id'] },
-      { name: `Tasks-${env}`, keyAttrs: ['task_id'] },
-      { name: `PlayerEventSummary-${env}`, keyAttrs: ['player_id', 'event_id'] },
-    ];
-
     let totalDeleted = 0;
-    for (const table of tables) {
-      try {
-        // Scan all items
-        let items = [];
-        let lastKey = undefined;
-        do {
-          const scanResp = await ddbClient.send(new ScanCommand({
-            TableName: table.name,
-            ProjectionExpression: table.keyAttrs.join(', '),
-            ExclusiveStartKey: lastKey,
-          }));
-          items.push(...(scanResp.Items || []));
-          lastKey = scanResp.LastEvaluatedKey;
-        } while (lastKey);
 
-        // Batch delete in chunks of 25
-        for (let i = 0; i < items.length; i += 25) {
-          const batch = items.slice(i, i + 25);
-          const deleteRequests = batch.map((item) => {
-            const key = {};
-            for (const attr of table.keyAttrs) {
-              key[attr] = item[attr];
-            }
-            return { DeleteRequest: { Key: key } };
-          });
-          await ddbClient.send(new BatchWriteItemCommand({
-            RequestItems: { [table.name]: deleteRequests },
-          }));
-        }
-        totalDeleted += items.length;
-        console.log(`[RESET] Cleared ${items.length} items from ${table.name}`);
-      } catch (tableErr) {
-        console.warn(`[RESET] Failed to clear ${table.name}: ${tableErr.message}`);
-      }
+    // 1. Delete player record
+    try {
+      await docClient.send(new DeleteCommand({
+        TableName: `Players-${env}`,
+        Key: { player_id },
+      }));
+      totalDeleted++;
+      console.log(`[RESET] Deleted player ${player_id} from Players-${env}`);
+    } catch (err) {
+      console.warn(`[RESET] Failed to delete player: ${err.message}`);
     }
 
-    res.json({ success: true, message: `Reset complete. Deleted ${totalDeleted} items from DynamoDB.` });
+    // 2. Delete player's tasks (query by player_id-index)
+    try {
+      const tasksResp = await docClient.send(new QueryCommand({
+        TableName: `Tasks-${env}`,
+        IndexName: 'player_id-index',
+        KeyConditionExpression: 'player_id = :pid',
+        ExpressionAttributeValues: { ':pid': player_id },
+      }));
+      const tasks = tasksResp.Items || [];
+      for (const task of tasks) {
+        await docClient.send(new DeleteCommand({
+          TableName: `Tasks-${env}`,
+          Key: { task_id: task.task_id },
+        }));
+      }
+      totalDeleted += tasks.length;
+      console.log(`[RESET] Deleted ${tasks.length} tasks for player ${player_id}`);
+    } catch (err) {
+      console.warn(`[RESET] Failed to delete tasks: ${err.message}`);
+    }
+
+    // 3. Delete player's events (query by player_id partition key)
+    try {
+      const eventsResp = await docClient.send(new QueryCommand({
+        TableName: `PlayerEventSummary-${env}`,
+        KeyConditionExpression: 'player_id = :pid',
+        ExpressionAttributeValues: { ':pid': player_id },
+      }));
+      const events = eventsResp.Items || [];
+      for (const event of events) {
+        await docClient.send(new DeleteCommand({
+          TableName: `PlayerEventSummary-${env}`,
+          Key: { player_id: event.player_id, event_id: event.event_id },
+        }));
+      }
+      totalDeleted += events.length;
+      console.log(`[RESET] Deleted ${events.length} events for player ${player_id}`);
+    } catch (err) {
+      console.warn(`[RESET] Failed to delete events: ${err.message}`);
+    }
+
+    res.json({ success: true, message: `Deleted ${totalDeleted} items for player ${player_id}.` });
   } catch (err) {
-    console.error('Error resetting game data:', err);
+    console.error('Error resetting player data:', err);
     res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -327,6 +354,10 @@ wss.on('connection', (ws, req) => {
           ws.send(JSON.stringify({ type: 'players_list', players: playersList }));
           // Broadcast new player to others
           broadcastToOthers(ws, { type: 'player_join', ...playerInfo });
+          // Trigger pre-generation on login (now we have ws for console notifications)
+          taskPreGenerator.triggerPreGeneration(player_id, 'player_login', {
+            is_new: true,
+          }, ws);
           break;
         }
 

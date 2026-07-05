@@ -90,6 +90,7 @@ async function handleBattle(ws, message) {
   ws.send(JSON.stringify(battleEndMsg));
 
   // Check task progress if victory
+  let anyTaskCompleted = false;
   if (battleResult.result === 'victory') {
     const taskUpdates = taskManager.checkTaskProgress(
       player,
@@ -108,6 +109,7 @@ async function handleBattle(ws, message) {
       // Auto-complete tasks whose conditions are all met
       for (const update of taskUpdates) {
         if (update.taskComplete) {
+          anyTaskCompleted = true;
           const completeResult = taskManager.completeTask(player, update.taskId);
           if (completeResult.success) {
             ws.send(
@@ -127,12 +129,16 @@ async function handleBattle(ws, message) {
   // Save updated player data
   await playerDataService.savePlayer(player);
 
-  // Trigger async pre-generation for next NPC dialogue
-  taskPreGenerator.triggerPreGeneration(player_id, `battle_${battleResult.result}`, {
-    monster_id,
-    monster_name: battleResult.monster_name,
-    rewards: battleResult.rewards,
-  });
+  // Trigger pre-generation only if no task was completed in this battle.
+  // If a task was completed, pre-generation will be triggered from the
+  // task_complete handler after DynamoDB status is updated.
+  if (!anyTaskCompleted) {
+    taskPreGenerator.triggerPreGeneration(player_id, `battle_${battleResult.result}`, {
+      monster_id,
+      monster_name: battleResult.monster_name,
+      rewards: battleResult.rewards,
+    }, ws);
+  }
 }
 
 module.exports = { handleBattle };

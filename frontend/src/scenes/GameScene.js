@@ -441,6 +441,21 @@ export default class GameScene extends Phaser.Scene {
       // Server-driven task update
     });
 
+    // --- Pre-generation event handlers ---
+    this.wsClient.on('pre_generation_started', (data) => {
+      console.log(`[PreGen] Started: event=${data.event_type}`);
+      this.writePreGenConsole('started', data.event_type, data);
+    });
+
+    this.wsClient.on('pre_generation_complete', (data) => {
+      console.log(`[PreGen] Complete: event=${data.event_type}, npc=${data.npc_name}, hasTask=${data.has_task}`);
+      this.writePreGenConsole('complete', data.event_type, data);
+    });
+
+    this.wsClient.on('pre_generation_skipped', (data) => {
+      console.log(`[PreGen] Skipped: event=${data.event_type}, reason=${data.reason}`);
+    });
+
     // --- Multiplayer handlers ---
     this.wsClient.on('players_list', (data) => {
       for (const p of data.players || []) {
@@ -487,7 +502,9 @@ export default class GameScene extends Phaser.Scene {
 
     let lastToolName = '';
     for (const entry of debugLog) {
-      if (entry.type === 'memory') {
+      if (entry.type === 'memory' && entry.action === 'save_event') {
+        html += `<div class="log-entry log-memory">[Memory] 写入事件: ${this.escapeHtml(entry.description || entry.event_type)}</div>`;
+      } else if (entry.type === 'memory') {
         const status = entry.enabled ? 'ON' : 'OFF';
         const detail = entry.enabled
           ? `actor=${this.escapeHtml(entry.actor_id)}, session=${this.escapeHtml(entry.session_id)}`
@@ -541,6 +558,29 @@ export default class GameScene extends Phaser.Scene {
           .join(', ');
         html += `<div class="log-entry log-timing">⏱ ${this.escapeHtml(entry.label)}: ${entry.total_ms}ms (${this.escapeHtml(details)})</div>`;
       }
+    }
+
+    html += `</div>`;
+    consoleBody.innerHTML += html;
+    consoleBody.scrollTop = consoleBody.scrollHeight;
+  }
+
+  writePreGenConsole(status, eventType, data) {
+    const consoleBody = document.getElementById('agent-console-body');
+    if (!consoleBody) return;
+
+    const now = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    let html = `<div class="log-session">`;
+
+    if (status === 'started') {
+      html += `<div class="log-header">[${now}] 事件驱动预生成</div>`;
+      html += `<div class="log-entry log-prefetch">⚡ [PreGen] 事件 "${this.escapeHtml(eventType)}" 触发，正在后台调用 LLM 预生成任务...</div>`;
+    } else if (status === 'complete') {
+      html += `<div class="log-header">[${now}] 预生成完成</div>`;
+      html += `<div class="log-entry log-prefetch">⚡ [PreGen] NPC "${this.escapeHtml(data.npc_name || '')}" 的对话和任务已缓存，等待玩家对话时即时下发</div>`;
+    } else if (status === 'skipped') {
+      html += `<div class="log-header">[${now}] 预生成跳过</div>`;
+      html += `<div class="log-entry" style="color:#999;">⊘ [PreGen] ${this.escapeHtml(data.reason || '该NPC已有活跃任务')}</div>`;
     }
 
     html += `</div>`;
