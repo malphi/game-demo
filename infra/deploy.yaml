@@ -39,7 +39,7 @@ Parameters:
 
   BedrockModelId:
     Type: String
-    Default: us.anthropic.claude-3-5-haiku-20241022-v1:0
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
     Description: Bedrock model ID for the NPC agent
 
   BedrockRegion:

@@ -2,6 +2,13 @@ node_modules/
 dist/
 __pycache__/
 *.pyc
+.venv/
 .DS_Store
 .env
 /dynamodb-local/
+
+# Local-only assets (architecture drafts, reference images/PDFs)
+AI_Native_Pixel_World_Architecture.pdf
+AI_RPG_Architecture_Blueprint.pdf
+architecture-v2.drawio
+image-1951460-1.png

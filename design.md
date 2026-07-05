@@ -306,18 +306,23 @@ Demo 使用一个简单的 2D 俯视角地图，包含以下区域：
 
 #### 4.1.1 当前 Demo 架构（已实现）
 
-前后端均运行在同一台 EC2 上，通过 SSM 端口转发访问。玩家行为事件直接写入 DynamoDB，无数据流管道。
+玩家浏览器通过 CloudFront（HTTPS 单一入口）经 VPC Origin 访问私有子网中的内网 ALB，再转发到 EC2 上的 Game Server（前后端同进程）。玩家行为事件直接写入 DynamoDB，无数据流管道。EC2/ALB 均无公网 IP，CloudFront 是唯一公网入口；SSM 端口转发保留作为可选调试通道。
 
 ```mermaid
 graph TB
-    DEV[开发者终端]
+    USER[用户浏览器]
+    CF[CloudFront<br/>HTTPS 单一入口]
+    DEV[开发者终端<br/>SSM 调试]
 
-    subgraph VPC [AWS VPC - 私有子网]
-        STATIC[Express.js static 前端资源]
-        API[REST API / WebSocket]
-        BT[战斗系统]
-        TK[任务奖励结算]
-        EE[事件发射器]
+    subgraph VPC [AWS VPC]
+        ALB[Internal ALB<br/>私有子网, 无公网IP]
+        subgraph PRIV [私有子网 - EC2]
+            STATIC[Express.js static 前端资源]
+            API[REST API / WebSocket]
+            BT[战斗系统]
+            TK[任务奖励结算]
+            EE[事件发射器]
+        end
     end
 
     subgraph AIModule [AI 模块]
@@ -328,27 +333,34 @@ graph TB
 
     DDB[(DynamoDB)]
 
-    DEV -->|SSM 端口转发| API
+    USER -->|HTTPS / WSS| CF
+    CF -->|VPC Origin| ALB
+    ALB -->|:8080| API
+    DEV -.->|SSM 端口转发 :8080| API
     API --> DDB
     DDB --> API
     EE -->|行为事件直写| DDB
     API -->|NPC 对话请求| AC
     AC --> SA
-    SA -->|Claude 3.5 Haiku| BR
+    SA -->|Claude Haiku 4.5| BR
     SA -->|读取玩家数据+行为事件| DDB
     SA -->|校验后写入任务| DDB
 ```
 
 **架构说明：**
-- 前端静态资源由 EC2 通过 Express.js `express.static` 提供，前后端在同一进程
-- 无 ALB、无 CloudFront，通过 SSM Session Manager 端口转发访问 EC2
+- 玩家访问入口为 CloudFront（HTTPS，默认 `*.cloudfront.net` 证书），经 VPC Origin 直连私有子网的内网 ALB，再转发到 EC2:8080
+- 前端静态资源由 EC2 通过 Express.js `express.static` 提供（**非** S3 Origin），前后端在同一进程；REST 与 WebSocket 均走同一 CloudFront 分发
+- 内网 ALB 无公网 IP，安全组两阶段收紧为仅接受 CloudFront 流量（详见 `architecture-analysis.md` §9.4.1）；EC2 安全组仅放行来自 ALB 的 8080
+- SSM Session Manager 端口转发保留为可选调试通道（绕过 CloudFront/ALB 直连 EC2）
 - 玩家行为事件由 EventEmitter 直写 DynamoDB `PlayerEventSummary` 表，无 Kinesis/S3 管道
 - NPC Agent 从 DynamoDB 读取最近 20 条行为事件作为 LLM context
-- EC2 运行在私有子网，无公网入口，通过 VPC Endpoints 访问 AWS 服务（无 NAT Gateway）
+- EC2 与 AgentCore 运行在私有子网，通过 VPC Endpoints 访问 AWS 服务（无 NAT Gateway）
 
 #### 4.1.2 正式生产架构（目标）
 
 前端通过 ALB 访问后端，玩家行为事件走 Kinesis 数据流管道持久化到 S3，NPC Agent 从 S3 读取完整行为历史作为 context。
+
+> **与 4.1.1 已实现架构的差异**：本目标架构额外引入 S3 前端 Origin（静态资源与 API 分离）和 Kinesis→Firehose→S3 行为日志管道，尚未实现。此外，已实现架构采用 **CloudFront VPC Origin + 内网 ALB**（ALB 在私有子网、无公网 IP），比本图中的"公有子网 ALB"暴露面更小。
 
 ```mermaid
 graph TB
@@ -392,7 +404,7 @@ graph TB
     FH -->|按日期分区归档| S3_LOG
     API -->|NPC 对话请求| AC
     AC --> SA
-    SA -->|Claude 3.5 Haiku| BR
+    SA -->|Claude Haiku 4.5| BR
     SA -->|读取玩家数据| DDB
     SA -->|读取完整行为历史| S3_LOG
     SA -->|校验后写入任务| DDB
@@ -417,12 +429,15 @@ Demo 架构中，EC2 和 AgentCore 均运行在 VPC 私有子网，**不使用 N
 │                                                         │
 │  ┌─ 公有子网 ──────────────┐                            │
 │  │  10.0.1.0/24, 10.0.2.0/24                           │
-│  │  IGW → 公网出口 (仅 CloudFront Origin Pull 等)       │
+│  │  IGW (VPC Origins 前置要求，不承载业务流量)          │
 │  └─────────────────────────┘                            │
+│                                                         │
+│  CloudFront ──VPC Origin(内网 ENI)──→ 内网 ALB(私有子网) │
 │                                                         │
 │  ┌─ 私有子网 ──────────────┐     ┌─ VPC Endpoints ───┐  │
 │  │  10.0.3.0/24, 10.0.4.0/24    │                    │  │
 │  │                         │     │  Gateway (免费):   │  │
+│  │  内网 ALB ──────────────┼─:8080─→ EC2 游戏服务器   │  │
 │  │  EC2 游戏服务器 ────────┼────→│   · DynamoDB      │  │
 │  │  AgentCore Runtime ─────┼────→│   · S3            │  │
 │  │                         │     │                    │  │
@@ -458,6 +473,8 @@ Demo 架构中，EC2 和 AgentCore 均运行在 VPC 私有子网，**不使用 N
 
 #### 关键设计决策
 
+- **公网入口经 CloudFront VPC Origin**：ALB 为内网型（`internal`，位于私有子网、无公网 IP），CloudFront 经 VPC Origin 的服务托管 ENI 直连 ALB，无需 NAT/公网 ALB。公有子网仅因 VPC Origins 前置要求保留 IGW，不承载业务流量
+- **ALB 安全组两阶段收紧**：阶段 1 放行 CloudFront 托管前缀列表，阶段 2 收紧为仅服务托管 SG `CloudFront-VPCOrigins-Service-SG`（详见 `architecture-analysis.md` §9.4.1）
 - **无 NAT Gateway**：私有子网无 `0.0.0.0/0` 路由，所有流量通过 VPC Endpoints 走 AWS 内网，不经公网
 - **Node.js 安装**：使用 AL2023 内置 `dnf install nodejs20`（AL2023 软件源托管在 S3，通过 S3 Gateway Endpoint 访问）
 - **npm 依赖**：在部署脚本构建阶段执行 `npm ci`，将 `node_modules` 打包进 zip，EC2 上不再执行 `npm ci`
@@ -489,7 +506,7 @@ Demo 架构中，EC2 和 AgentCore 均运行在 VPC 私有子网，**不使用 N
 
 ### 4.3 游戏逻辑服务（EC2）
 
-使用 Amazon EC2 托管游戏服务器（Node.js + Express + WebSocket），运行在 VPC 私有子网中，通过 SSM Session Manager 端口转发访问。通过 Auto Scaling Group（单实例）管理生命周期，代码包从 S3 下载并通过 systemd 管理进程。
+使用 Amazon EC2 托管游戏服务器（Node.js + Express + WebSocket），运行在 VPC 私有子网中，玩家流量经 CloudFront → 内网 ALB → EC2:8080 到达（SSM Session Manager 端口转发作为可选调试通道）。通过 Auto Scaling Group（单实例）管理生命周期，代码包从 S3 下载并通过 systemd 管理进程。
 
 **模块划分：**
 
@@ -558,7 +575,7 @@ graph TB
     T1 --> GS
     GS -->|InvokeAgentRuntime| PREFETCH
     PREFETCH -->|并行读取| DDB
-    LLM_CALL -->|Claude 3.5 Haiku| BR
+    LLM_CALL -->|Claude Haiku 4.5| BR
     WRITE --> DDB
     WRITE -->|dialogue task debug_log| GS
     GS -->|推送到前端| T1
@@ -611,7 +628,7 @@ flowchart TD
     PREFETCH --> F6[Tasks: 已有任务]
 
     F1 & F2 & F3 & F4 & F5 & F6 --> BUILD[精简数据 → 构建 Prompt]
-    BUILD --> LLM[单次 Bedrock Converse API 调用<br/>Claude 3.5 Haiku 分析并生成 JSON]
+    BUILD --> LLM[单次 Bedrock Converse API 调用<br/>Claude Haiku 4.5 分析并生成 JSON]
 
     LLM --> PARSE[解析 LLM 返回的 JSON]
     PARSE --> VALIDATE[任务校验模块 validate_task]
@@ -799,7 +816,7 @@ import boto3, json, time, uuid
 dynamodb = boto3.resource("dynamodb")
 bedrock_client = boto3.client("bedrock-runtime", region_name="us-west-2")
 
-BEDROCK_MODEL_ID = "us.anthropic.claude-3-5-haiku-20241022-v1:0"
+BEDROCK_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 SYSTEM_PROMPT_TEMPLATE = open("prompts/npc_system_prompt.txt").read()
 
 def prefetch_all_data(player_id: str) -> dict:
@@ -900,7 +917,7 @@ sequenceDiagram
     end
     DDB-->>Agent: 所有数据就绪
 
-    Note over Agent,LLM: 单次 LLM 调用 Claude 3.5 Haiku
+    Note over Agent,LLM: 单次 LLM 调用 Claude Haiku 4.5
     Agent->>Agent: 精简数据, 构建 User Message
     Agent->>LLM: System Prompt + User Message
     LLM-->>Agent: JSON dialogue + task
@@ -1194,16 +1211,18 @@ flowchart LR
 
 | 服务 | 用途 |
 |------|------|
-| Amazon EC2 | 游戏服务器（私有子网，ASG 单实例），通过 `express.static` 提供前端静态资源，通过 SSM 端口转发访问 |
+| Amazon CloudFront | 玩家访问的 HTTPS 单一入口，经 VPC Origin 连接内网 ALB |
+| Elastic Load Balancing (ALB) | 内网型 ALB（私有子网），CloudFront 与 EC2 之间的转发层，健康检查 `/api/health` |
+| Amazon EC2 | 游戏服务器（私有子网，ASG 单实例），通过 `express.static` 提供前端静态资源，经 ALB 访问（SSM 端口转发为可选调试） |
 | Amazon ECR | NPC Agent 容器镜像仓库 |
 | AWS AgentCore | NPC Agent 部署与运行（VPC 私有模式，容器化部署） |
-| Amazon Bedrock | Converse API 调用（Claude 3.5 Haiku） |
+| Amazon Bedrock | Converse API 调用（Claude Haiku 4.5） |
 | Amazon DynamoDB | 游戏业务数据 + 行为日志摘要持久化 |
 | Amazon Kinesis Data Stream | 玩家行为日志实时采集 |
 | Amazon Kinesis Data Firehose | 日志数据投递到 S3 |
 | Amazon S3 | 行为日志长期存储、AgentCore 制品存储 |
 | Amazon VPC | 网络隔离（公有子网: IGW，私有子网: EC2/AgentCore，VPC Endpoints 替代 NAT Gateway） |
-| AWS Systems Manager | Session Manager 端口转发（开发阶段远程访问） |
+| AWS Systems Manager | Session Manager 端口转发（可选调试访问 / 代码部署下发） |
 
 ### 9.1 AWS 服务成本估算（基于 100 万次/月调用）
 

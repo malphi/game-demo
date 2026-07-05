@@ -104,7 +104,14 @@ deploy_stack() {
   local cf_vpcorigin_sg=""
   cf_vpcorigin_sg=$(get_cloudfront_vpcorigin_sg 2>/dev/null || echo "")
 
-  echo "    CloudFront prefix list: ${cf_prefix_list_id:-<none>}"
+  # Phase 2: once the service-managed SG exists, it is the most restrictive source
+  # (this distribution only). Drop the broader prefix-list rule so the ALB SG allows
+  # ONLY the CloudFront VPC origin SG — true minimal exposure.
+  if [[ -n "${cf_vpcorigin_sg}" ]]; then
+    cf_prefix_list_id=""
+  fi
+
+  echo "    CloudFront prefix list: ${cf_prefix_list_id:-<none, phase 2>}"
   echo "    CloudFront VPC origin SG: ${cf_vpcorigin_sg:-<none, phase 1>}"
 
   aws cloudformation deploy \

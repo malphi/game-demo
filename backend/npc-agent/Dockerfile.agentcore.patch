@@ -1,7 +1,0 @@
-FROM npc-agent-agentcore:latest
-
-COPY memory_config.py /app/memory_config.py
-COPY agent.py /app/agent.py
-COPY agentcore_app.py /app/agentcore_app.py
-COPY tools/create_task.py /app/tools/create_task.py
-COPY prompts/npc_system_prompt.txt /app/prompts/npc_system_prompt.txt
